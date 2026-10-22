@@ -1,30 +1,31 @@
 package com.aryan.overlay
 
-import android.annotation.SuppressLint
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.media.AudioManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebView
 import org.json.JSONArray
@@ -32,335 +33,514 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Always-on helper:
- *  1. Listens for the exact word "Moon" (no popup).
- *  2. Draws comets + calligraphy "Yes Aryan" over the live home screen
- *     (transparent, touch-through, lightly blurred) and says "Yes Aryan".
- *  3. Listens for your question, asks OpenRouter, speaks the answer.
- */
 class OverlayService : Service() {
 
     companion object {
         const val ACTION_SHOW = "com.aryan.overlay.SHOW"
         const val ACTION_WAKE = "com.aryan.overlay.WAKE"
-        private const val CHANNEL = "aryan_overlay"
-        private const val BLUR_RADIUS = 8      // "very low" blur. 0 = off
-        private const val WAKE_WORD = "moon"   // exact match only
-        private const val REPLY = "Yes Aryan"
-        private const val SHOW_MS = 5500
-        private const val SYSTEM_PROMPT =
-            "You are Aryan AI, a loyal, smart voice assistant. " +
-            "Keep answers short (1-3 sentences), plain text, no markdown."
+        const val ACTION_VOICE = "com.aryan.overlay.VOICE"
+        private const val CH = "overlay_status"
+        private const val NID = 1
     }
 
-    private enum class Mode { WAKE, COMMAND, BUSY }
-
-    private lateinit var wm: WindowManager
-    private lateinit var nm: NotificationManager
-    private lateinit var notif: Notification.Builder
     private val handler = Handler(Looper.getMainLooper())
-    private var web: WebView? = null
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
-    private var mode = Mode.BUSY
-    private val history = ArrayList<JSONObject>()
-    private val mutedStreams = ArrayList<Int>()
+    private var overlay: WebView? = null
+    private var mode = 0
+    private var listening = false
+    private var started = false
+    private var destroyed = false
+    private var pendingMode = 0
+    private var lastHeard = "-"
+    private var lastAnswer = ""
+
+    private fun p() = Cfg.prefs(this)
+    private fun s(k: String) = Cfg.str(p(), k)
+
+    private val restartRunnable = Runnable { startListen(pendingMode) }
     private val hideRunnable = Runnable { hideOverlay() }
 
-    // ---------- broadcasts (test buttons) ----------
     private val receiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                ACTION_SHOW -> showOverlay(
-                    intent.getStringExtra("text") ?: REPLY,
-                    intent.getIntExtra("ms", SHOW_MS)
-                )
+        override fun onReceive(c: Context?, i: Intent?) {
+            when (i?.action) {
+                ACTION_SHOW -> showOverlay(s("reply"))
                 ACTION_WAKE -> onWake()
+                ACTION_VOICE -> { stopRecognizer(); speak(s("reply"), "test") }
+                else -> {}
             }
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
-
+    // ---------- lifecycle ----------
     override fun onCreate() {
         super.onCreate()
-        wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Aryan Overlay", NotificationManager.IMPORTANCE_LOW)
-        )
-        notif = Notification.Builder(this, CHANNEL)
-            .setContentTitle("Say \"Moon\"")
-            .setContentText("Starting...")
-            .setSmallIcon(android.R.drawable.star_on)
+            NotificationChannel(CH, "Assistant status", NotificationManager.IMPORTANCE_LOW))
+        val n = notif("Starting...", "")
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                startForeground(NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } catch (e: Exception) {
+                startForeground(NID, n)
+            }
+        } else {
+            startForeground(NID, n)
+        }
+        val f = IntentFilter()
+        f.addAction(ACTION_SHOW)
+        f.addAction(ACTION_WAKE)
+        f.addAction(ACTION_VOICE)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, f, 4)
+        else registerReceiver(receiver, f)
+
+        tts = TextToSpeech(this) { st ->
+            if (st == TextToSpeech.SUCCESS) {
+                ttsReady = true
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(id: String?) {}
+                    override fun onDone(id: String?) { handler.post { onSpoken(id ?: "") } }
+                    override fun onError(id: String?) { handler.post { onSpoken(id ?: "") } }
+                })
+            }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!started) {
+            started = true
+            scheduleListen(0, 300)
+        }
+        return START_STICKY
+    }
+
+    override fun onBind(i: Intent?): IBinder? = null
+
+    override fun onDestroy() {
+        destroyed = true
+        handler.removeCallbacksAndMessages(null)
+        try { unregisterReceiver(receiver) } catch (_: Exception) {}
+        stopRecognizer()
+        hideOverlay()
+        try { tts?.shutdown() } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    // ---------- notification ----------
+    private fun notif(title: String, text: String): Notification {
+        val pi = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, CH)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setContentIntent(pi)
             .setOngoing(true)
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(1, notif.build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(1, notif.build())
-        }
-
-        val filter = IntentFilter()
-        filter.addAction(ACTION_SHOW)
-        filter.addAction(ACTION_WAKE)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(receiver, filter)
-        }
-
-        tts = TextToSpeech(this) { s -> ttsReady = (s == TextToSpeech.SUCCESS) }
-        startListening(Mode.WAKE, 500)
+            .build()
     }
 
-    // ---------- helpers ----------
-    private fun status(text: String) {
-        notif.setContentText(text)
-        nm.notify(1, notif.build())
-    }
-
-    private fun isWake(text: String?): Boolean {
-        val cleaned = (text ?: "").lowercase().replace(Regex("[^a-z0-9 ]"), "").trim()
-        return cleaned == WAKE_WORD
-    }
-
-    private fun muteBeep() {
-        if (mutedStreams.isNotEmpty()) return
+    private fun status(title: String, text: String) {
         try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            for (s in intArrayOf(AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM)) {
-                if (!am.isStreamMute(s)) {
-                    try {
-                        am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, 0)
-                        mutedStreams.add(s)
-                    } catch (_: Exception) {}
-                }
-            }
+            getSystemService(NotificationManager::class.java).notify(NID, notif(title, text))
         } catch (_: Exception) {}
     }
 
-    private fun unmuteBeep() {
-        try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            for (s in mutedStreams) {
-                try { am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, 0) } catch (_: Exception) {}
-            }
-        } catch (_: Exception) {}
-        mutedStreams.clear()
+    private fun refreshStatus() {
+        val title = if (mode == 0) "Listening for wake word" else "Listening for your question"
+        var text = "Heard: " + lastHeard
+        if (lastAnswer.isNotEmpty()) text += "\n\n" + lastAnswer
+        status(title, text)
     }
 
-    private fun speak(text: String, onDone: () -> Unit) {
-        val t = tts
-        if (t == null || !ttsReady) {
-            handler.postDelayed({ onDone() }, 800)
+    // ---------- listening ----------
+    private fun scheduleListen(m: Int, delay: Long) {
+        handler.removeCallbacks(restartRunnable)
+        pendingMode = m
+        handler.postDelayed(restartRunnable, delay)
+    }
+
+    private fun stopRecognizer() {
+        listening = false
+        val r = recognizer
+        recognizer = null
+        if (r != null) {
+            try { r.cancel() } catch (_: Exception) {}
+            try { r.destroy() } catch (_: Exception) {}
+        }
+    }
+
+    private fun startListen(m: Int) {
+        if (destroyed) return
+        handler.removeCallbacks(restartRunnable)
+        stopRecognizer()
+        mode = m
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED) {
+            status("Microphone permission needed", "Open the app and allow the microphone.")
+            scheduleListen(m, 3000)
             return
         }
-        val id = "u" + System.currentTimeMillis()
-        t.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onError(utteranceId: String?) { handler.post { onDone() } }
-            override fun onDone(utteranceId: String?) { handler.post { onDone() } }
-        })
-        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
-    }
-
-    // ---------- speech recognition ----------
-    private fun destroyRecognizer() {
-        try { recognizer?.cancel() } catch (_: Exception) {}
-        try { recognizer?.destroy() } catch (_: Exception) {}
-        recognizer = null
-    }
-
-    private fun startListening(newMode: Mode, delayMs: Long = 0) {
-        handler.postDelayed({
-            mode = newMode
-            destroyRecognizer()
-            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-                status("Speech recognition is not available (install/enable Google app)")
-                return@postDelayed
-            }
-            if (newMode == Mode.WAKE) {
-                muteBeep()
-                status("Listening for \"Moon\"...")
-            } else {
-                unmuteBeep()
-                status("Listening for your question...")
-            }
+        try {
             val r = SpeechRecognizer.createSpeechRecognizer(this)
             r.setRecognitionListener(listener)
-            recognizer = r
             val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             i.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            val lang = s("listen_lang").trim()
+            if (lang.isNotEmpty()) {
+                i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+                i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang)
+            }
+            recognizer = r
+            listening = true
             r.startListening(i)
-        }, delayMs)
+            refreshStatus()
+        } catch (e: Exception) {
+            status("Voice recognition problem", e.message ?: "unknown")
+            scheduleListen(m, 3000)
+        }
+    }
+
+    private fun first(b: Bundle?): String? =
+        b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+
+    private fun heard(t: String) {
+        if (t == lastHeard) return
+        lastHeard = t
+        refreshStatus()
     }
 
     private val listener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onReadyForSpeech(b: Bundle?) {}
         override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onRmsChanged(v: Float) {}
+        override fun onBufferReceived(b: ByteArray?) {}
         override fun onEndOfSpeech() {}
-        override fun onPartialResults(partialResults: Bundle?) {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
+        override fun onEvent(t: Int, b: Bundle?) {}
 
-        override fun onError(error: Int) {
-            when (mode) {
-                Mode.WAKE -> {
-                    if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                        status("Microphone permission missing - open the app")
-                        return
-                    }
-                    val wait = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1200L else 300L
-                    startListening(Mode.WAKE, wait)
-                }
-                Mode.COMMAND -> {
-                    mode = Mode.BUSY
-                    speak("Sorry, I did not hear that.") { startListening(Mode.WAKE, 300) }
-                }
-                Mode.BUSY -> {}
+        override fun onPartialResults(b: Bundle?) {
+            if (!listening) return
+            val t = first(b) ?: return
+            heard(t)
+            if (mode == 0 && isWake(t)) {
+                listening = false
+                handler.post { onWake() }
             }
         }
 
-        override fun onResults(results: Bundle?) {
-            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val first = list?.firstOrNull()
-            when (mode) {
-                Mode.WAKE -> {
-                    status("Heard: " + (first ?: "-"))
-                    if (isWake(first)) onWake() else startListening(Mode.WAKE, 200)
+        override fun onResults(b: Bundle?) {
+            if (!listening) return
+            listening = false
+            val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            val top = list?.firstOrNull()
+            if (top != null) heard(top)
+            if (mode == 0) {
+                if (list != null && list.any { isWake(it) }) onWake()
+                else scheduleListen(0, 150)
+            } else {
+                val q = top?.trim().orEmpty()
+                if (q.isEmpty()) scheduleListen(0, 200) else askAI(q)
+            }
+        }
+
+        override fun onError(e: Int) {
+            if (!listening) return
+            listening = false
+            when (e) {
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    status("Microphone permission needed", "Open the app and allow the microphone.")
+                    scheduleListen(0, 3000)
                 }
-                Mode.COMMAND -> {
-                    val q = first?.trim().orEmpty()
-                    if (q.isEmpty()) {
-                        mode = Mode.BUSY
-                        speak("Sorry, I did not hear that.") { startListening(Mode.WAKE, 300) }
-                    } else {
-                        askAi(q)
-                    }
-                }
-                Mode.BUSY -> {}
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> scheduleListen(0, 1500)
+                SpeechRecognizer.ERROR_NO_MATCH,
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleListen(0, 150)
+                else -> scheduleListen(0, 800)
             }
         }
     }
 
-    // ---------- wake flow ----------
+    private fun norm(t: String): String =
+        t.lowercase().replace(Regex("[^\\p{L}\\p{N} ]"), " ")
+            .replace(Regex("\\s+"), " ").trim()
+
+    private fun isWake(text: String): Boolean {
+        val t = norm(text)
+        if (t.isEmpty()) return false
+        val exact = Cfg.bool(p(), "exact")
+        for (w in s("wake_words").split(",")) {
+            val ww = norm(w)
+            if (ww.isEmpty()) continue
+            if (exact) {
+                if (t == ww) return true
+            } else if ((" " + t + " ").contains(" " + ww + " ")) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // ---------- flow ----------
     private fun onWake() {
-        mode = Mode.BUSY
-        destroyRecognizer()
-        unmuteBeep()
-        handler.post { showOverlay(REPLY, SHOW_MS) }
-        speak(REPLY) { startListening(Mode.COMMAND, 200) }
+        stopRecognizer()
+        handler.removeCallbacks(restartRunnable)
+        val reply = s("reply")
+        showOverlay(reply)
+        status("Wake word heard", reply)
+        if (Cfg.bool(p(), "speak_reply")) speak(reply, "reply") else afterReply()
     }
 
-    private fun askAi(question: String) {
-        mode = Mode.BUSY
-        status("You: $question")
-        val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
-        val key = prefs.getString("key", "") ?: ""
-        val model = prefs.getString("model", "openai/gpt-4o-mini") ?: "openai/gpt-4o-mini"
-        if (key.isBlank()) {
-            speak("Please open the app and save your OpenRouter key.") { startListening(Mode.WAKE, 300) }
-            return
-        }
-        history.add(JSONObject().put("role", "user").put("content", question))
-        Thread {
-            val answer = try {
-                val msgs = JSONArray()
-                msgs.put(JSONObject().put("role", "system").put("content", SYSTEM_PROMPT))
-                for (m in history.takeLast(8)) msgs.put(m)
-                val body = JSONObject().put("model", model).put("messages", msgs)
+    private fun afterReply() {
+        if (Cfg.bool(p(), "ask_question")) scheduleListen(1, 300) else scheduleListen(0, 300)
+    }
 
-                val conn = URL("https://openrouter.ai/api/v1/chat/completions")
-                    .openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Authorization", "Bearer $key")
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.connectTimeout = 15000
-                conn.readTimeout = 60000
-                conn.doOutput = true
-                conn.outputStream.use { it.write(body.toString().toByteArray()) }
-                val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
-                val resp = stream.bufferedReader().readText()
-                val j = JSONObject(resp)
-                if (!j.has("choices")) throw RuntimeException(resp)
-                j.getJSONArray("choices").getJSONObject(0)
-                    .getJSONObject("message").getString("content").trim()
+    private fun onSpoken(id: String) {
+        when (id) {
+            "reply" -> afterReply()
+            "answer", "test" -> scheduleListen(0, 300)
+            else -> {}
+        }
+    }
+
+    private fun askAI(q: String) {
+        status("Thinking...", "You: " + q)
+        Thread {
+            val ans = try {
+                callAI(q)
             } catch (e: Exception) {
-                "Sorry, I could not get an answer from the AI."
+                "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
             }
-            handler.post {
-                history.add(JSONObject().put("role", "assistant").put("content", answer))
-                status("AI: " + answer.take(80))
-                speak(answer.take(3500)) { startListening(Mode.WAKE, 300) }
-            }
+            handler.post { onAnswer(q, ans) }
         }.start()
     }
 
-    // ---------- overlay ----------
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun showOverlay(text: String, ms: Int) {
-        hideOverlay()
-        val w = WebView(this)
-        w.setBackgroundColor(Color.TRANSPARENT)
-        w.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-        w.settings.javaScriptEnabled = true
-        w.isClickable = false
-        w.isFocusable = false
+    private fun onAnswer(q: String, a: String) {
+        lastAnswer = "You: " + q + "\nAI: " + a
+        status("Answered", lastAnswer)
+        if (Cfg.bool(p(), "speak_answer")) speak(a, "answer") else scheduleListen(0, 300)
+    }
 
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            PixelFormat.TRANSLUCENT
-        )
-        if (Build.VERSION.SDK_INT >= 28) {
-            lp.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+    // ---------- speech ----------
+    private fun speak(text: String, id: String) {
+        val t = tts
+        if (t == null || !ttsReady || text.isBlank()) {
+            handler.post { onSpoken(id) }
+            return
         }
-        if (Build.VERSION.SDK_INT >= 31) {
-            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-            lp.blurBehindRadius = BLUR_RADIUS
-        }
-
-        w.loadUrl("file:///android_asset/index.html?text=" + Uri.encode(text) + "&ms=" + ms)
         try {
-            wm.addView(w, lp)
-            web = w
-            handler.postDelayed(hideRunnable, ms.toLong())
+            val vn = s("voice_name")
+            if (vn.isNotEmpty()) {
+                t.voices?.firstOrNull { it.name == vn }?.let { t.setVoice(it) }
+            } else {
+                t.defaultVoice?.let { t.setVoice(it) }
+            }
+            t.setSpeechRate(Cfg.int(p(), "speech_rate") / 100f)
+            t.setPitch(Cfg.int(p(), "pitch") / 100f)
+            val r = t.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
+            if (r != TextToSpeech.SUCCESS) handler.post { onSpoken(id) }
         } catch (e: Exception) {
-            w.destroy()
-            status("Overlay blocked - allow Display over other apps")
+            handler.post { onSpoken(id) }
         }
     }
 
+    // ---------- AI ----------
+    private fun post(url: String, headers: Map<String, String>, body: String): String {
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.requestMethod = "POST"
+        c.connectTimeout = 15000
+        c.readTimeout = 30000
+        c.doOutput = true
+        for ((k, v) in headers) c.setRequestProperty(k, v)
+        c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+        val code = c.responseCode
+        val stream = if (code in 200..299) c.inputStream else c.errorStream
+        val txt = stream?.bufferedReader()?.use { it.readText() } ?: ""
+        if (code !in 200..299) throw Exception("HTTP " + code + " " + txt.take(100))
+        return txt
+    }
+
+    private fun callAI(q: String): String {
+        val key = s("key").trim()
+        if (key.isEmpty()) return "Please add your API key in the app settings."
+        val sys = s("system_prompt").replace("{name}", s("ai_name"))
+        val model = s("model").trim()
+        if (key.startsWith("sk-ant-")) {
+            val m = if (model.isEmpty()) "claude-haiku-5-5"
+                    else model.substringAfter("/").replace(".", "-")
+            val body = JSONObject()
+                .put("model", m)
+                .put("max_tokens", 300)
+                .put("system", sys)
+                .put("messages", JSONArray().put(
+                    JSONObject().put("role", "user").put("content", q)))
+            val txt = post("https://api.anthropic.com/v1/messages",
+                mapOf("x-api-key" to key,
+                      "anthropic-version" to "2023-06-01",
+                      "content-type" to "application/json"),
+                body.toString())
+            return JSONObject(txt).getJSONArray("content")
+                .getJSONObject(0).getString("text").trim()
+        } else {
+            val m = if (model.isEmpty()) "anthropic/claude-haiku-5.5" else model
+            val msgs = JSONArray()
+                .put(JSONObject().put("role", "system").put("content", sys))
+                .put(JSONObject().put("role", "user").put("content", q))
+            val body = JSONObject()
+                .put("model", m)
+                .put("max_tokens", 300)
+                .put("messages", msgs)
+            val txt = post("https://openrouter.ai/api/v1/chat/completions",
+                mapOf("Authorization" to "Bearer " + key,
+                      "Content-Type" to "application/json"),
+                body.toString())
+            return JSONObject(txt).getJSONArray("choices").getJSONObject(0)
+                .getJSONObject("message").getString("content").trim()
+        }
+    }
+
+    // ---------- overlay ----------
     private fun hideOverlay() {
         handler.removeCallbacks(hideRunnable)
-        web?.let {
-            try { wm.removeView(it) } catch (_: Exception) {}
-            it.destroy()
+        val v = overlay
+        overlay = null
+        if (v != null) {
+            try { getSystemService(WindowManager::class.java).removeView(v) } catch (_: Exception) {}
+            try { v.destroy() } catch (_: Exception) {}
         }
-        web = null
     }
 
-    override fun onDestroy() {
+    private fun showOverlay(text: String) {
         hideOverlay()
-        destroyRecognizer()
-        unmuteBeep()
-        try { tts?.shutdown() } catch (_: Exception) {}
-        try { unregisterReceiver(receiver) } catch (_: Exception) {}
-        super.onDestroy()
+        if (!Settings.canDrawOverlays(this)) return
+        try {
+            val pr = p()
+            val dur = Cfg.int(pr, "duration").coerceIn(2, 15)
+            val wv = WebView(this)
+            wv.setBackgroundColor(Color.TRANSPARENT)
+            wv.settings.javaScriptEnabled = true
+            wv.loadDataWithBaseURL("https://localhost/", html(text, dur),
+                "text/html", "utf-8", null)
+            val lp = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT)
+            val dim = Cfg.int(pr, "dim")
+            if (dim > 0) {
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND
+                lp.dimAmount = dim / 100f
+            }
+            val blur = Cfg.int(pr, "blur")
+            if (Build.VERSION.SDK_INT >= 31 && blur > 0) {
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                lp.blurBehindRadius = (blur * resources.displayMetrics.density).toInt()
+            }
+            getSystemService(WindowManager::class.java).addView(wv, lp)
+            overlay = wv
+            handler.postDelayed(hideRunnable, dur * 1000L + 700L)
+        } catch (e: Exception) {
+            status("Overlay problem", e.message ?: "unknown")
+        }
+    }
+
+    private fun html(text: String, dur: Int): String {
+        val pr = p()
+        fun col(k: String): String {
+            val v = Cfg.str(pr, k).trim()
+            return if (Regex("^#[0-9a-fA-F]{6}\$").matches(v)) v else Cfg.default(k)
+        }
+        val cc = col("comet_color")
+        val tc = col("text_color")
+        val c = Color.parseColor(cc)
+        val font = Cfg.str(pr, "font")
+        val css: String
+        val link: String
+        when (font) {
+            "System cursive" -> { css = "cursive"; link = "" }
+            "System sans" -> { css = "sans-serif"; link = "" }
+            else -> {
+                css = "'" + font + "', cursive"
+                link = "<link href=\"https://fonts.googleapis.com/css2?family=" +
+                    font.replace(" ", "+") + "&display=swap\" rel=\"stylesheet\">"
+            }
+        }
+        val dir = listOf("Down-left", "Down-right", "Straight down")
+            .indexOf(Cfg.str(pr, "direction")).coerceAtLeast(0)
+
+        val page = """<!doctype html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+@@LINK@@
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:transparent;transition:opacity .6s}
+canvas{position:fixed;left:0;top:0;width:100%;height:100%}
+#t{position:fixed;left:0;right:0;top:@@TOP@@%;transform:translateY(-50%);text-align:center;font-family:@@FONT@@;font-size:@@SIZE@@px;color:@@TCOL@@;text-shadow:0 0 18px @@CCOL@@,0 0 4px #000;padding:0 20px;opacity:0;animation:fin .8s ease forwards}
+@keyframes fin{from{opacity:0;transform:translateY(-40%)}to{opacity:1;transform:translateY(-50%)}}
+</style></head><body><canvas id="c"></canvas><div id="t"></div>
+<script>
+document.getElementById('t').textContent=@@JSTEXT@@;
+var C=document.getElementById('c'),X=C.getContext('2d');
+function rs(){C.width=innerWidth;C.height=innerHeight}rs();addEventListener('resize',rs);
+var DIR=@@DIR@@,SP=@@SPEED@@,TL=@@TAIL@@,DN=@@DENS@@,SPK=@@SPARK@@,COL=[@@R@@,@@G@@,@@B@@];
+function rgba(a){return 'rgba('+COL[0]+','+COL[1]+','+COL[2]+','+a+')'}
+var cm=[],pt=[];
+function spawn(){
+  var w=C.width,h=C.height,px,py;
+  if(DIR==2){px=Math.random()*w;py=-20}
+  else if(DIR==0){if(Math.random()<0.6){px=Math.random()*w*1.2;py=-20}else{px=w+20;py=Math.random()*h*0.5}}
+  else{if(Math.random()<0.6){px=-w*0.2+Math.random()*w*1.2;py=-20}else{px=-20;py=Math.random()*h*0.5}}
+  var s=(5+SP*2.5)*(0.7+Math.random()*0.6);
+  var vx=DIR==0?-0.6:(DIR==1?0.6:0),vy=1,n=Math.sqrt(vx*vx+vy*vy);
+  cm.push({x:px,y:py,vx:vx/n*s,vy:vy/n*s,l:TL*28+40,w:2+Math.random()*2});
+}
+for(var k=0;k<DN;k++)spawn();
+function frame(){
+  X.clearRect(0,0,C.width,C.height);
+  if(Math.random()<DN*0.025)spawn();
+  for(var i=cm.length-1;i>=0;i--){
+    var m=cm[i];m.x+=m.vx;m.y+=m.vy;
+    var sp=Math.sqrt(m.vx*m.vx+m.vy*m.vy),tx=m.x-m.vx/sp*m.l,ty=m.y-m.vy/sp*m.l;
+    var g=X.createLinearGradient(m.x,m.y,tx,ty);g.addColorStop(0,rgba(1));g.addColorStop(1,rgba(0));
+    X.strokeStyle=g;X.lineWidth=m.w;X.lineCap='round';X.beginPath();X.moveTo(m.x,m.y);X.lineTo(tx,ty);X.stroke();
+    X.shadowColor=rgba(1);X.shadowBlur=14;X.fillStyle='#ffffff';X.beginPath();X.arc(m.x,m.y,m.w*0.9,0,6.283);X.fill();X.shadowBlur=0;
+    if(SPK&&Math.random()<0.6)pt.push({x:m.x,y:m.y,vx:(Math.random()-0.5)*1.5,vy:(Math.random()-0.5)*1.5,a:1});
+    if(m.y>C.height+400||m.x<-400||m.x>C.width+400)cm.splice(i,1);
+  }
+  for(var j=pt.length-1;j>=0;j--){
+    var q=pt[j];q.x+=q.vx;q.y+=q.vy;q.a-=0.02;
+    if(q.a<=0){pt.splice(j,1);continue}
+    X.fillStyle=rgba(q.a);X.beginPath();X.arc(q.x,q.y,1.6,0,6.283);X.fill();
+  }
+  requestAnimationFrame(frame);
+}
+frame();
+setTimeout(function(){document.body.style.opacity=0},(@@DUR@@-0.6)*1000);
+</script></body></html>"""
+
+        return page
+            .replace("@@LINK@@", link)
+            .replace("@@TOP@@", Cfg.int(pr, "text_top").toString())
+            .replace("@@FONT@@", css)
+            .replace("@@SIZE@@", Cfg.int(pr, "text_size").toString())
+            .replace("@@TCOL@@", tc)
+            .replace("@@CCOL@@", cc)
+            .replace("@@JSTEXT@@", JSONObject.quote(text))
+            .replace("@@DIR@@", dir.toString())
+            .replace("@@SPEED@@", Cfg.int(pr, "speed").toString())
+            .replace("@@TAIL@@", Cfg.int(pr, "tail").toString())
+            .replace("@@DENS@@", Cfg.int(pr, "density").toString())
+            .replace("@@SPARK@@", if (Cfg.bool(pr, "sparkles")) "1" else "0")
+            .replace("@@R@@", Color.red(c).toString())
+            .replace("@@G@@", Color.green(c).toString())
+            .replace("@@B@@", Color.blue(c).toString())
+            .replace("@@DUR@@", dur.toString())
     }
 }
