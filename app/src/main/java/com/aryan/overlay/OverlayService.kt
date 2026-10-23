@@ -54,6 +54,16 @@ class OverlayService : Service() {
         // after the wake word is heard "exactly", wait this long to make sure
         // the user did not keep talking (so "yes aryan is great" does NOT trigger)
         private const val WAKE_CONFIRM_MS = 700L
+
+        // Music fix: while music/video is playing, the mic restarts make the audio
+        // stutter or slow down (worst on Bluetooth headphones). With this true the
+        // app pauses wake-word listening while media plays and resumes within ~2 s
+        // after it stops. Set to false to keep listening during music.
+        private const val PAUSE_WHEN_MUSIC_PLAYS = true
+
+        // Even if the option above is false, still pause when music plays through
+        // Bluetooth, because the mic forces Bluetooth into a low-quality mode.
+        private const val PAUSE_ON_BLUETOOTH_MUSIC = true
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -183,8 +193,8 @@ class OverlayService : Service() {
     }
 
     // ---------- beep muting ----------
-    private var muted = false        // notification + system streams muted by us
-    private var musicMuted = false   // music stream muted by us
+    // The MUSIC stream is never touched, so your music is not affected.
+    private var muted = false
 
     private fun beepPrefs() = getSharedPreferences("beep_state", Context.MODE_PRIVATE)
 
@@ -196,33 +206,12 @@ class OverlayService : Service() {
     }
 
     private fun muteBeep(on: Boolean) {
+        if (on == muted) return
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        if (on) {
-            if (!muted) {
-                setStream(am, AudioManager.STREAM_NOTIFICATION, true)
-                setStream(am, AudioManager.STREAM_SYSTEM, true)
-                muted = true
-                beepPrefs().edit().putBoolean("muted", true).apply()
-            }
-            // never silence the user's music/video while it is playing
-            val playing = am.isMusicActive
-            if (playing && musicMuted) {
-                setStream(am, AudioManager.STREAM_MUSIC, false)
-                musicMuted = false
-            } else if (!playing && !musicMuted) {
-                setStream(am, AudioManager.STREAM_MUSIC, true)
-                musicMuted = true
-            }
-        } else {
-            if (muted) {
-                setStream(am, AudioManager.STREAM_NOTIFICATION, false)
-                setStream(am, AudioManager.STREAM_SYSTEM, false)
-            }
-            if (musicMuted) setStream(am, AudioManager.STREAM_MUSIC, false)
-            muted = false
-            musicMuted = false
-            beepPrefs().edit().putBoolean("muted", false).apply()
-        }
+        setStream(am, AudioManager.STREAM_NOTIFICATION, on)
+        setStream(am, AudioManager.STREAM_SYSTEM, on)
+        muted = on
+        beepPrefs().edit().putBoolean("muted", on).apply()
     }
 
     // if the app was killed while muted, restore the volume on next start
@@ -234,6 +223,26 @@ class OverlayService : Service() {
             setStream(am, AudioManager.STREAM_MUSIC, false)
             beepPrefs().edit().putBoolean("muted", false).apply()
         }
+    }
+
+    private fun bluetoothAudioOut(am: AudioManager): Boolean {
+        return try {
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                (Build.VERSION.SDK_INT >= 31 &&
+                    (it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                     it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER))
+            }
+        } catch (_: Exception) { false }
+    }
+
+    // true = do not open the mic right now because media is playing
+    private fun shouldPauseForMusic(): Boolean {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (!am.isMusicActive) return false
+        if (PAUSE_WHEN_MUSIC_PLAYS) return true
+        return PAUSE_ON_BLUETOOTH_MUSIC && bluetoothAudioOut(am)
     }
 
     // ---------- listening ----------
@@ -263,6 +272,12 @@ class OverlayService : Service() {
             PackageManager.PERMISSION_GRANTED) {
             status("Microphone permission needed", "Open the app and allow the microphone.")
             scheduleListen(m, 3000)
+            return
+        }
+        if (m == 0 && shouldPauseForMusic()) {
+            muteBeep(false)
+            status("Paused while music plays", "Wake word listening resumes when it stops.")
+            scheduleListen(0, 2000)
             return
         }
         try {
