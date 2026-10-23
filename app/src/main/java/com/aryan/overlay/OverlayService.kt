@@ -371,7 +371,7 @@ private fun muteBeep(on: Boolean) {
     }
         private fun tryCommand(q: String): String? {
         val t = norm(q)
-        Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m ->
+        Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m -> Regex("^(?:open|launch|start) (.+)$").find(t)?.let { m ->
             val svc = PhoneAgentService.instance
             if (svc != null) {
                 if (PhoneAgentService.model == null)
