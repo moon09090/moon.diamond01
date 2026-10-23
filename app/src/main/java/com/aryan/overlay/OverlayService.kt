@@ -128,6 +128,7 @@ class OverlayService : Service() {
         hideOverlay()
         try { tts?.shutdown() } catch (_: Exception) {}
         super.onDestroy()
+        muteBeep(false)
     }
 
     // ---------- notification ----------
@@ -156,6 +157,21 @@ class OverlayService : Service() {
         if (lastAnswer.isNotEmpty()) text += "\n\n" + lastAnswer
         status(title, text)
     }
+    private var muted = false
+private fun muteBeep(on: Boolean) {
+    if (on == muted) return
+    val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+    if (on && am.isMusicActive) return   // don't mute your music
+    muted = on
+    val d = if (on) android.media.AudioManager.ADJUST_MUTE
+            else android.media.AudioManager.ADJUST_UNMUTE
+    for (st in intArrayOf(
+        android.media.AudioManager.STREAM_MUSIC,
+        android.media.AudioManager.STREAM_NOTIFICATION,
+        android.media.AudioManager.STREAM_SYSTEM)) {
+        try { am.adjustStreamVolume(st, d, 0) } catch (_: Exception) {}
+    }
+}
 
     // ---------- listening ----------
     private fun scheduleListen(m: Int, delay: Long) {
@@ -198,6 +214,11 @@ class OverlayService : Service() {
             if (lang.isNotEmpty()) {
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang)
+            }
+            muteBeep(m == 0)
+            if (m == 0) {
+    i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+    i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
             }
             recognizer = r
             listening = true
@@ -289,6 +310,7 @@ class OverlayService : Service() {
 
     // ---------- flow ----------
     private fun onWake() {
+        muteBeep(false)
         stopRecognizer()
         handler.removeCallbacks(restartRunnable)
         val reply = s("reply")
@@ -379,6 +401,7 @@ class OverlayService : Service() {
 
     // ---------- speech ----------
     private fun speak(text: String, id: String) {
+        muteBeep(false)
         val t = tts
         if (t == null || !ttsReady || text.isBlank()) {
             handler.post { onSpoken(id) }
