@@ -12,6 +12,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.camera2.CameraManager
+import android.net.Uri
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
@@ -308,6 +310,11 @@ class OverlayService : Service() {
     }
 
     private fun askAI(q: String) {
+        val local = tryCommand(q)          // instant phone commands, no AI needed
+        if (local != null) {
+            onAnswer(q, local)
+            return
+        }
         status("Thinking...", "You: " + q)
         Thread {
             val ans = try {
@@ -323,6 +330,51 @@ class OverlayService : Service() {
         lastAnswer = "You: " + q + "\nAI: " + a
         status("Answered", lastAnswer)
         if (Cfg.bool(p(), "speak_answer")) speak(a, "answer") else scheduleListen(0, 300)
+    }
+
+    // ---------- phone commands (open apps, torch, search) ----------
+    private fun launch(i: Intent): Boolean =
+        try { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true }
+        catch (_: Exception) { false }
+
+    private fun findApp(name: String): Pair<String, String>? {
+        val n = name.replace(" ", "")
+        if (n.length < 3) return null
+        val pm = packageManager
+        val apps = pm.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0
+        ).map { it.loadLabel(pm).toString() to it.activityInfo.packageName }
+        return apps.firstOrNull { norm(it.first).replace(" ", "") == n }
+            ?: apps.firstOrNull { norm(it.first).replace(" ", "").contains(n) }
+    }
+
+    private fun tryCommand(q: String): String? {
+        val t = norm(q)
+        Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
+            val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
+            val hit = findApp(name)
+            if (hit != null) {
+                val i = packageManager.getLaunchIntentForPackage(hit.second)
+                if (i != null && launch(i)) return "Opening " + hit.first
+            }
+        }
+        if (t.contains("torch") || t.contains("flashlight")) {
+            val on = !Regex("\\boff\\b").containsMatchIn(t)
+            try {
+                val cm = getSystemService(CameraManager::class.java)
+                cm.setTorchMode(cm.cameraIdList[0], on)
+                return if (on) "Torch on" else "Torch off"
+            } catch (_: Exception) {}
+        }
+        Regex("^play (.+)$").find(t)?.let { m ->
+            val u = "https://www.youtube.com/results?search_query=" + Uri.encode(m.groupValues[1])
+            if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching YouTube"
+        }
+        Regex("^(?:search|google) (?:for )?(.+)$").find(t)?.let { m ->
+            val u = "https://www.google.com/search?q=" + Uri.encode(m.groupValues[1])
+            if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching"
+        }
+        return null
     }
 
     // ---------- speech ----------
