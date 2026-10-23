@@ -36,6 +36,17 @@ import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebView
+import android.accessibilityservice.AccessibilityService
+import android.os.BatteryManager
+import android.provider.AlarmClock
+import android.provider.ContactsContract
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import android.view.KeyEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
@@ -60,6 +71,15 @@ class OverlayService : Service() {
         // (Indian English). Change only the name; the URL is built from it.
         private const val MODEL_NAME = "vosk-model-small-en-us-0.15"
         private const val MODEL_URL = "https://alphacephei.com/vosk/models/" + MODEL_NAME + ".zip"
+
+        // ---- feature switches (true = on) ----
+        private const val FOLLOW_UP = true            // keep listening after an AI answer
+        private const val HISTORY_PAIRS = 6           // how many past exchanges the AI remembers
+        private const val HISTORY_MINUTES = 10L       // forget after this much silence
+        private const val STOP_WHILE_SPEAKING = true  // say "stop" to interrupt its voice
+        private const val WEB_SEARCH = true           // let the AI look things up online
+        private const val CONFIRM_RISKY_TASKS = true  // ask "are you sure?" before risky agent tasks
+        private const val SCREEN_PRIVATE = "~private~"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -74,6 +94,10 @@ class OverlayService : Service() {
     private var pendingMode = 0
     private var lastHeard = "-"
     private var lastAnswer = ""
+    private var afterAnswerMode = 0
+    private var pendingGoal: String? = null
+    private val history = ArrayList<Pair<String, String>>()
+    private var lastChat = 0L
 
     private fun p() = Cfg.prefs(this)
     private fun s(k: String) = Cfg.str(p(), k)
@@ -174,7 +198,11 @@ class OverlayService : Service() {
     }
 
     private fun refreshStatus() {
-        val title = if (mode == 0) "Waiting for wake word" else "Listening for your question"
+        val title = when (mode) {
+            0 -> "Waiting for wake word"
+            2 -> "Speaking (say stop to interrupt)"
+            else -> "Listening for your question"
+        }
         var text = "Heard: " + lastHeard
         if (lastAnswer.isNotEmpty()) text += "\n\n" + lastAnswer
         status(title, text)
@@ -305,11 +333,11 @@ class OverlayService : Service() {
 
     private fun startWake() {
         if (destroyed || wakeRun) return
-        if (wakeThread?.isAlive == true) { scheduleListen(0, 200); return }
+        if (wakeThread?.isAlive == true) { scheduleListen(mode, 200); return }
         val model = voskModel
         if (model == null) {
             ensureModel()
-            scheduleListen(0, 3000)
+            scheduleListen(mode, 3000)
             return
         }
         wakeRun = true
@@ -366,11 +394,40 @@ class OverlayService : Service() {
         wakeRun = false
     }
 
-    // runs on the main thread for every finished phrase the wake engine hears
+    private val stopWords = setOf("stop", "stop it", "stop talking", "stop speaking",
+        "be quiet", "cancel", "cancel that", "enough", "never mind")
+
+    private fun isStopWord(text: String) = norm(text) in stopWords
+
+    // stops its voice and any running agent task
+    private fun interrupt() {
+        try { tts?.stop() } catch (_: Exception) {}
+        cancelAgent()
+        pendingGoal = null
+        handler.removeCallbacks(restartRunnable)
+        status("Stopped", "")
+        scheduleListen(0, 300)
+    }
+
+    // asks the agent service to stop, if it has a stop-type method (safe if it does not)
+    private fun cancelAgent() {
+        val svc = PhoneAgentService.instance ?: return
+        for (name in arrayOf("stop", "cancel", "stopGoal", "cancelGoal", "abort", "stopAgent")) {
+            try { svc.javaClass.getMethod(name).invoke(svc); return } catch (_: Throwable) {}
+        }
+    }
+
+    // runs on the main thread for every finished phrase the engine hears
     private fun onWakeText(text: String) {
-        if (!wakeRun || mode != 0) return
+        if (!wakeRun) return
+        if (mode == 2) {                      // while it speaks: only "stop" counts
+            if (isStopWord(text)) interrupt()
+            return
+        }
+        if (mode != 0) return
         heard(text)
-        if (isWake(text)) onWake()      // EXACT match only
+        if (isWake(text)) onWake()            // EXACT match only
+        else if (isStopWord(text)) interrupt()
     }
 
     // ---------- listening ----------
@@ -394,7 +451,7 @@ class OverlayService : Service() {
     private fun startListen(m: Int) {
         if (destroyed) return
         handler.removeCallbacks(restartRunnable)
-        if (m == 0 && wakeRun && recognizer == null) return   // already waiting silently
+        if ((m == 0 || m == 2) && wakeRun && recognizer == null && mode == m) return
         stopRecognizer()
         mode = m
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
@@ -403,7 +460,7 @@ class OverlayService : Service() {
             scheduleListen(m, 3000)
             return
         }
-        if (m == 0) {
+        if (m == 0 || m == 2) {
             startWake()
             return
         }
@@ -511,35 +568,119 @@ class OverlayService : Service() {
     private fun onSpoken(id: String) {
         when (id) {
             "reply" -> afterReply()
-            "answer", "test" -> scheduleListen(0, 300)
+            "answer" -> scheduleListen(afterAnswerMode, 300)
+            "test" -> scheduleListen(0, 300)
             else -> {}
         }
     }
 
+    private val yesWords = setOf("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
+        "do it", "go ahead", "yes please", "correct", "proceed", "affirmative")
+
     private fun askAI(q: String) {
-        val local = tryCommand(q)          // instant phone commands, no AI needed
-        if (local != null) {
-            onAnswer(q, local)
+        // 1) waiting for a yes/no about a risky agent task
+        val pg = pendingGoal
+        if (pg != null) {
+            pendingGoal = null
+            val ans = if (norm(q) in yesWords) startAgent(pg) else "Okay, cancelled"
+            onAnswer(q, ans)
             return
         }
+        // 2) questions about what is on the screen
+        if (isScreenQuestion(q)) { askAboutScreen(q); return }
+        // 3) instant phone commands, no AI needed
+        val local = tryCommand(q)
+        if (local != null) {
+            onAnswer(q, local, pendingGoal != null)
+            return
+        }
+        // 4) normal AI answer
         status("Thinking...", "You: " + q)
         Thread {
             val ans = try {
-                callAI(q)
+                callAI(q, q)
             } catch (e: Exception) {
                 "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
             }
-            handler.post { onAnswer(q, ans) }
+            handler.post { onAnswer(q, ans, FOLLOW_UP) }
         }.start()
     }
 
-    private fun onAnswer(q: String, a: String) {
+    private fun onAnswer(q: String, a: String, followUp: Boolean = false) {
         lastAnswer = "You: " + q + "\nAI: " + a
         status("Answered", lastAnswer)
-        if (Cfg.bool(p(), "speak_answer")) speak(a, "answer") else scheduleListen(0, 300)
+        afterAnswerMode = if (followUp) 1 else 0
+        if (Cfg.bool(p(), "speak_answer")) speak(a, "answer") else scheduleListen(afterAnswerMode, 300)
     }
 
-    // ---------- phone commands (open apps, torch, search) ----------
+    // ---------- privacy: apps the assistant will never read or operate ----------
+    private fun sensitivePkg(pkg: String?): Boolean = isSensitivePackage(pkg)
+
+    private val sensitiveGoalRegex =
+        Regex("\\b(bank|banking|password|passwords|otp|cvv|upi|pin|card number)\\b")
+    private val riskyGoalRegex = Regex(
+        "\\b(pay|send|transfer|buy|order|purchase|delete|remove|uninstall|post|publish|call|" +
+        "message|text|whatsapp|email|book|subscribe|reset|format)\\b")
+
+    private fun startAgent(goal: String): String {
+        val svc = PhoneAgentService.instance
+            ?: return "Please turn on the accessibility service for agent tasks"
+        val pkg = try { svc.rootInActiveWindow?.packageName?.toString() } catch (_: Exception) { null }
+        if (sensitiveGoalRegex.containsMatchIn(norm(goal)) || sensitivePkg(pkg))
+            return "I won't operate banking or password apps"
+        if (PhoneAgentService.model == null)
+            PhoneAgentService.model = OpenRouterModel(s("key").trim())
+        svc.runGoal(goal)
+        return "Okay, working on it"
+    }
+
+    // ---------- screen reading ----------
+    private fun isScreenQuestion(q: String): Boolean {
+        val t = norm(q)
+        return listOf("on my screen", "on the screen", "this screen", "this page",
+            "read my screen", "what am i looking at", "explain this", "summarize this")
+            .any { t.contains(it) }
+    }
+
+    // null = service off, SCREEN_PRIVATE = sensitive app, otherwise the visible text
+    private fun screenText(): String? {
+        val svc = PhoneAgentService.instance ?: return null
+        val root = try { svc.rootInActiveWindow } catch (_: Exception) { null } ?: return null
+        if (sensitivePkg(root.packageName?.toString())) return SCREEN_PRIVATE
+        val sb = StringBuilder()
+        fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+            if (n == null || depth > 25 || sb.length > 3500) return
+            if (n.isPassword) return
+            val tx = n.text?.toString() ?: n.contentDescription?.toString()
+            if (!tx.isNullOrBlank()) sb.append(tx.trim()).append('\n')
+            for (i in 0 until n.childCount) walk(n.getChild(i), depth + 1)
+        }
+        walk(root, 0)
+        return sb.toString().take(3500)
+    }
+
+    private fun askAboutScreen(q: String) {
+        val txt = screenText()
+        when {
+            txt == null -> onAnswer(q, "Turn on the accessibility service so I can see the screen")
+            txt == SCREEN_PRIVATE -> onAnswer(q, "That looks like a private app, so I won't read it")
+            txt.isBlank() -> onAnswer(q, "I can't find any text on this screen")
+            else -> {
+                status("Reading screen...", "You: " + q)
+                Thread {
+                    val ans = try {
+                        callAI("Here is the text currently visible on my phone screen:\n" + txt +
+                            "\n\nMy request: " + q, q)
+                    } catch (e: Exception) {
+                        "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
+                    }
+                    handler.post { onAnswer(q, ans, FOLLOW_UP) }
+                }.start()
+            }
+        }
+    }
+
+    // ---------- phone commands (no AI needed) ----------
     private fun launch(i: Intent): Boolean =
         try { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true }
         catch (_: Exception) { false }
@@ -555,17 +696,199 @@ class OverlayService : Service() {
             ?: apps.firstOrNull { norm(it.first).replace(" ", "").contains(n) }
     }
 
+    private fun mediaKey(code: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+    }
+
+    private fun volume(dir: Int) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        repeat(2) {
+            am.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, AudioManager.FLAG_SHOW_UI)
+        }
+    }
+
+    private fun global(action: Int, ok: String): String {
+        val svc = PhoneAgentService.instance
+            ?: return "Please turn on the accessibility service first"
+        return if (svc.performGlobalAction(action)) ok else "That didn't work"
+    }
+
+    private fun callTarget(arg: String): String {
+        val digits = arg.replace(" ", "")
+        if (Regex("^\\d{5,}$").matches(digits)) {
+            return if (launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + digits))))
+                "Opening the dialer" else "I couldn't open the dialer"
+        }
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) !=
+            PackageManager.PERMISSION_GRANTED)
+            return "To call by name, allow Contacts permission for this app in Android settings"
+        try {
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER,
+                        ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME),
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+                arrayOf("%" + arg + "%"), null
+            )?.use { c ->
+                if (c.moveToFirst()) {
+                    val num = c.getString(0)
+                    val nm = c.getString(1)
+                    return if (launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + num))))
+                        "Dialing " + nm + ". Tap call" else "I couldn't open the dialer"
+                }
+            }
+        } catch (_: Exception) {}
+        return "I couldn't find " + arg + " in your contacts"
+    }
+
+    private fun readNotifications(): String {
+        if (!NotifListener.connected) {
+            launch(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            return "Please turn on notification access for this app, then ask again"
+        }
+        val list = NotifListener.recent(5)
+        if (list.isEmpty()) return "You have no new notifications"
+        return "Latest notifications. " + list.joinToString(". ")
+    }
+
     private fun tryCommand(q: String): String? {
         val t = norm(q)
+
+        // ----- agent task (with safety confirmation) -----
         Regex("^(?:agent|task) (.+)$").find(t)?.let { m ->
-            val svc = PhoneAgentService.instance
-            if (svc != null) {
-                if (PhoneAgentService.model == null)
-                    PhoneAgentService.model = OpenRouterModel(s("key").trim())
-                svc.runGoal(m.groupValues[1])
-                return "Okay, working on it"
+            val goal = m.groupValues[1]
+            if (PhoneAgentService.instance == null)
+                return "Please turn on the accessibility service for agent tasks"
+            if (sensitiveGoalRegex.containsMatchIn(goal))
+                return "I won't operate banking or password apps"
+            if (CONFIRM_RISKY_TASKS && riskyGoalRegex.containsMatchIn(goal)) {
+                pendingGoal = goal
+                return "You want me to " + goal + ". Say yes to confirm"
+            }
+            return startAgent(goal)
+        }
+
+        // ----- memory -----
+        if (Regex("^(?:forget (?:that|everything|this)|new chat|clear (?:the )?(?:chat|memory)|start over)$")
+                .matches(t)) {
+            synchronized(history) { history.clear() }
+            return "Okay, starting fresh"
+        }
+
+        // ----- notifications, time, date, battery -----
+        if (Regex("^(?:read|check|what are|any) (?:my |the )?(?:new )?(?:notifications|messages)").containsMatchIn(t))
+            return readNotifications()
+        if (Regex("what time|time is it|current time|tell me the time").containsMatchIn(t))
+            return "It's " + SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
+        if (Regex("what (?:is )?(?:the |today s |todays )?date|what day").containsMatchIn(t))
+            return "Today is " + SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(Date())
+        if (t.contains("battery")) {
+            return try {
+                val bm = getSystemService(BatteryManager::class.java)
+                val lvl = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                val bs = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                    ?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+                val charging = bs == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    bs == BatteryManager.BATTERY_STATUS_FULL
+                "Battery is at " + lvl + " percent" + (if (charging) " and charging" else "")
+            } catch (_: Exception) { "I couldn't read the battery" }
+        }
+
+        // ----- volume -----
+        Regex("(?:set )?volume (?:to )?(\\d{1,3})").find(t)?.let { m ->
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val pct = m.groupValues[1].toInt().coerceIn(0, 100)
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, max * pct / 100, AudioManager.FLAG_SHOW_UI)
+            return "Volume " + pct + " percent"
+        }
+        if (Regex("volume up|louder|increase (?:the )?volume|raise (?:the )?volume").containsMatchIn(t)) {
+            volume(AudioManager.ADJUST_RAISE); return "Volume up"
+        }
+        if (Regex("volume down|quieter|lower (?:the )?volume|decrease (?:the )?volume").containsMatchIn(t)) {
+            volume(AudioManager.ADJUST_LOWER); return "Volume down"
+        }
+
+        // ----- music / video controls -----
+        if (Regex("^(?:pause|pause (?:the )?(?:music|song|video)|stop (?:the )?(?:music|song|video))$").matches(t)) {
+            mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE); return "Paused"
+        }
+        if (Regex("^(?:play|resume|continue|play music|resume music|resume (?:the )?(?:music|video))$").matches(t)) {
+            mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY); return "Playing"
+        }
+        if (Regex("^(?:next|skip|next (?:song|track)|skip (?:song|track))$").matches(t)) {
+            mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT); return "Next"
+        }
+        if (Regex("^(?:previous|previous (?:song|track)|last song)$").matches(t)) {
+            mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS); return "Previous"
+        }
+
+        // ----- phone controls (need the accessibility service) -----
+        if (Regex("^(?:go )?home(?: screen)?$|^go to (?:the )?home screen$").matches(t))
+            return global(AccessibilityService.GLOBAL_ACTION_HOME, "Home")
+        if (Regex("^(?:go )?back$").matches(t))
+            return global(AccessibilityService.GLOBAL_ACTION_BACK, "Back")
+        if (Regex("recent apps|^recents$|show recents").containsMatchIn(t))
+            return global(AccessibilityService.GLOBAL_ACTION_RECENTS, "Recent apps")
+        if (Regex("open (?:the )?notifications|notification (?:panel|shade)|pull down notifications").containsMatchIn(t))
+            return global(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS, "Notifications")
+        if (t.contains("quick settings"))
+            return global(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS, "Quick settings")
+        if (Regex("lock (?:the )?(?:phone|screen)").containsMatchIn(t) && Build.VERSION.SDK_INT >= 28)
+            return global(AccessibilityService.GLOBAL_ACTION_LOCK_SCREEN, "Locked")
+        if (Regex("screenshot").containsMatchIn(t) && Build.VERSION.SDK_INT >= 28)
+            return global(AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT, "Screenshot taken")
+
+        // ----- settings pages -----
+        if (Regex("wi ?fi").containsMatchIn(t)) {
+            if (launch(Intent(Settings.ACTION_WIFI_SETTINGS))) return "Opening Wi-Fi settings"
+        }
+        if (t.contains("bluetooth")) {
+            if (launch(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))) return "Opening Bluetooth settings"
+        }
+        if (t == "open settings" || t == "settings") {
+            if (launch(Intent(Settings.ACTION_SETTINGS))) return "Opening settings"
+        }
+
+        // ----- timer and alarm -----
+        Regex("timer (?:for )?(\\d+) (second|seconds|minute|minutes|min|mins|hour|hours)").find(t)?.let { m ->
+            val n = m.groupValues[1].toInt()
+            val unit = m.groupValues[2]
+            val secs = when {
+                unit.startsWith("sec") -> n
+                unit.startsWith("min") -> n * 60
+                else -> n * 3600
+            }
+            val i = Intent(AlarmClock.ACTION_SET_TIMER)
+                .putExtra(AlarmClock.EXTRA_LENGTH, secs)
+                .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+            return if (launch(i)) "Timer set for " + n + " " + unit else "I couldn't set the timer"
+        }
+        if (t.contains("alarm")) {
+            Regex("alarm (?:for |at )?(\\d{1,2})(?: (\\d{2}))?(?: ?(a m|p m|am|pm))?").find(t)?.let { m ->
+                var h = m.groupValues[1].toInt()
+                val min = m.groupValues[2].ifEmpty { "0" }.toInt()
+                val ap = m.groupValues[3].replace(" ", "")
+                if (ap == "pm" && h < 12) h += 12
+                if (ap == "am" && h == 12) h = 0
+                if (h in 0..23 && min in 0..59) {
+                    val i = Intent(AlarmClock.ACTION_SET_ALARM)
+                        .putExtra(AlarmClock.EXTRA_HOUR, h)
+                        .putExtra(AlarmClock.EXTRA_MINUTES, min)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                    return if (launch(i))
+                        "Alarm set for " + h + ":" + min.toString().padStart(2, '0')
+                    else "I couldn't set the alarm"
+                }
             }
         }
+
+        // ----- calling -----
+        Regex("^(?:call|dial|phone) (.+)$").find(t)?.let { m -> return callTarget(m.groupValues[1]) }
+
+        // ----- open apps, torch, search -----
         Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
             val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
             val hit = findApp(name)
@@ -611,6 +934,7 @@ class OverlayService : Service() {
             t.setPitch(Cfg.int(p(), "pitch") / 100f)
             val r = t.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
             if (r != TextToSpeech.SUCCESS) handler.post { onSpoken(id) }
+            else if (STOP_WHILE_SPEAKING) scheduleListen(2, 600)
         } catch (e: Exception) {
             handler.post { onSpoken(id) }
         }
@@ -632,43 +956,91 @@ class OverlayService : Service() {
         return txt
     }
 
-    private fun callAI(q: String): String {
+    private fun needsWeb(q: String): Boolean {
+        val t = norm(q)
+        return listOf("news", "today", "latest", "current", "weather", "score", "price",
+            "who won", "right now", "tonight", "tomorrow", "this week", "stock", "update")
+            .any { t.contains(it) }
+    }
+
+    private fun historyMessages(q: String): JSONArray {
+        val msgs = JSONArray()
+        synchronized(history) {
+            if (System.currentTimeMillis() - lastChat > HISTORY_MINUTES * 60_000L) history.clear()
+            for ((u, a) in history.takeLast(HISTORY_PAIRS)) {
+                msgs.put(JSONObject().put("role", "user").put("content", u))
+                msgs.put(JSONObject().put("role", "assistant").put("content", a))
+            }
+        }
+        msgs.put(JSONObject().put("role", "user").put("content", q))
+        return msgs
+    }
+
+    private fun remember(question: String, answer: String) {
+        synchronized(history) {
+            history.add(question to answer)
+            while (history.size > HISTORY_PAIRS) history.removeAt(0)
+            lastChat = System.currentTimeMillis()
+        }
+    }
+
+    // q = what is sent to the AI, shown = short version stored in memory
+    private fun callAI(q: String, shown: String): String {
         val key = s("key").trim()
         if (key.isEmpty()) return "Please add your API key in the app settings."
-        val sys = s("system_prompt").replace("{name}", s("ai_name"))
+        val sys = s("system_prompt").replace("{name}", s("ai_name")) +
+            " Answer in one to three short spoken sentences. No markdown, lists or emojis."
         val model = s("model").trim()
+        val answer: String
         if (key.startsWith("sk-ant-")) {
             val m = if (model.isEmpty()) "claude-haiku-5-5"
                     else model.substringAfter("/").replace(".", "-")
-            val body = JSONObject()
-                .put("model", m)
-                .put("max_tokens", 300)
-                .put("system", sys)
-                .put("messages", JSONArray().put(
-                    JSONObject().put("role", "user").put("content", q)))
-            val txt = post("https://api.anthropic.com/v1/messages",
-                mapOf("x-api-key" to key,
-                      "anthropic-version" to "2023-06-01",
-                      "content-type" to "application/json"),
-                body.toString())
-            return JSONObject(txt).getJSONArray("content")
-                .getJSONObject(0).getString("text").trim()
+            val headers = mapOf("x-api-key" to key,
+                "anthropic-version" to "2023-06-01",
+                "content-type" to "application/json")
+            fun body(web: Boolean): String {
+                val b = JSONObject()
+                    .put("model", m)
+                    .put("max_tokens", 500)
+                    .put("system", sys)
+                    .put("messages", historyMessages(q))
+                if (web) b.put("tools", JSONArray().put(
+                    JSONObject().put("type", "web_search_20250305")
+                        .put("name", "web_search").put("max_uses", 2)))
+                return b.toString()
+            }
+            val txt = try {
+                post("https://api.anthropic.com/v1/messages", headers, body(WEB_SEARCH))
+            } catch (e: Exception) {
+                if (WEB_SEARCH) post("https://api.anthropic.com/v1/messages", headers, body(false))
+                else throw e
+            }
+            val arr = JSONObject(txt).getJSONArray("content")
+            val sb = StringBuilder()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                if (o.optString("type") == "text") sb.append(o.optString("text"))
+            }
+            answer = sb.toString().trim().ifEmpty { "I couldn't find an answer." }
         } else {
-            val m = if (model.isEmpty()) "anthropic/claude-haiku-5.5" else model
-            val msgs = JSONArray()
-                .put(JSONObject().put("role", "system").put("content", sys))
-                .put(JSONObject().put("role", "user").put("content", q))
+            var m = if (model.isEmpty()) "anthropic/claude-haiku-5.5" else model
+            if (WEB_SEARCH && needsWeb(shown) && !m.endsWith(":online")) m += ":online"
+            val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", sys))
+            val hist = historyMessages(q)
+            for (i in 0 until hist.length()) msgs.put(hist.getJSONObject(i))
             val body = JSONObject()
                 .put("model", m)
-                .put("max_tokens", 300)
+                .put("max_tokens", 500)
                 .put("messages", msgs)
             val txt = post("https://openrouter.ai/api/v1/chat/completions",
                 mapOf("Authorization" to "Bearer " + key,
                       "Content-Type" to "application/json"),
                 body.toString())
-            return JSONObject(txt).getJSONArray("choices").getJSONObject(0)
+            answer = JSONObject(txt).getJSONArray("choices").getJSONObject(0)
                 .getJSONObject("message").getString("content").trim()
         }
+        remember(shown, answer)
+        return answer
     }
 
     // ---------- overlay ----------
@@ -721,5 +1093,53 @@ class OverlayService : Service() {
         return raw
             .replace("q.get('text')||'Yes Aryan'", JSONObject.quote(text))
             .replace("parseInt(q.get('ms')||'6000',10)", (durSec * 1000).toString())
+    }
+}
+
+// ---------- privacy helper shared by the service and the notification reader ----------
+internal fun isSensitivePackage(pkg: String?): Boolean {
+    if (pkg == null) return false
+    val p = pkg.lowercase()
+    return listOf("bank", "paytm", "phonepe", "paisa", "gpay", "bhim", "wallet", "paypal",
+        "bitwarden", "1password", "lastpass", "keepass", "authenticator", "passwords",
+        "upi", "finance", "creditcard", "sbi", "hdfc", "icici", "axis").any { p.contains(it) }
+}
+
+// ---------- reads recent notifications so you can say "read my notifications" ----------
+// Needs: the <service> entry in AndroidManifest.xml and Notification access turned on
+// for this app in Android settings. Notification text stays on the phone.
+class NotifListener : NotificationListenerService() {
+
+    companion object {
+        @Volatile var connected = false
+        private val items = ArrayList<String>()
+
+        fun recent(max: Int): List<String> =
+            synchronized(items) { items.takeLast(max).reversed() }
+    }
+
+    override fun onListenerConnected() { connected = true }
+    override fun onListenerDisconnected() { connected = false }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        val n = sbn ?: return
+        if (n.packageName == packageName) return
+        val notif = n.notification ?: return
+        if ((notif.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if ((notif.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
+        val ex = notif.extras ?: return
+        val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+        if (title.isEmpty() && text.isEmpty()) return
+        val label = try {
+            packageManager.getApplicationLabel(
+                packageManager.getApplicationInfo(n.packageName, 0)).toString()
+        } catch (_: Exception) { n.packageName }
+        val line = if (isSensitivePackage(n.packageName)) label + ": private notification"
+                   else label + ": " + title + ". " + text
+        synchronized(items) {
+            items.add(line)
+            while (items.size > 15) items.removeAt(0)
+        }
     }
 }
