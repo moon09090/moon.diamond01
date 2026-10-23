@@ -13,6 +13,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraManager
+import android.media.AudioManager
 import android.net.Uri
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -27,6 +28,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebView
@@ -43,6 +45,15 @@ class OverlayService : Service() {
         const val ACTION_VOICE = "com.aryan.overlay.VOICE"
         private const val CH = "overlay_status"
         private const val NID = 1
+
+        // true  = silence the recognizer beeps while waiting for the wake word
+        //         (also mutes notification/system sounds during that time)
+        // false = never touch the phone volume (beeps may be heard)
+        private const val SILENT_MODE = true
+
+        // after the wake word is heard "exactly", wait this long to make sure
+        // the user did not keep talking (so "yes aryan is great" does NOT trigger)
+        private const val WAKE_CONFIRM_MS = 700L
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -64,12 +75,24 @@ class OverlayService : Service() {
     private val restartRunnable = Runnable { startListen(pendingMode) }
     private val hideRunnable = Runnable { hideOverlay() }
 
+    // fires only if the exact wake word stayed the final thing heard
+    private val wakeConfirm = Runnable {
+        if (listening && mode == 0) {
+            listening = false
+            onWake()
+        }
+    }
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             when (i?.action) {
                 ACTION_SHOW -> showOverlay(s("reply"))
                 ACTION_WAKE -> onWake()
-                ACTION_VOICE -> { stopRecognizer(); speak(s("reply"), "test") }
+                ACTION_VOICE -> {
+                    muteBeep(false)
+                    stopRecognizer()
+                    speak(s("reply"), "test")
+                }
                 else -> {}
             }
         }
@@ -78,6 +101,7 @@ class OverlayService : Service() {
     // ---------- lifecycle ----------
     override fun onCreate() {
         super.onCreate()
+        restoreIfStuckMuted()
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CH, "Assistant status", NotificationManager.IMPORTANCE_LOW))
@@ -127,8 +151,8 @@ class OverlayService : Service() {
         stopRecognizer()
         hideOverlay()
         try { tts?.shutdown() } catch (_: Exception) {}
-        super.onDestroy()
         muteBeep(false)
+        super.onDestroy()
     }
 
     // ---------- notification ----------
@@ -152,26 +176,65 @@ class OverlayService : Service() {
     }
 
     private fun refreshStatus() {
-        val title = if (mode == 0) "Listening for wake word" else "Listening for your question"
+        val title = if (mode == 0) "Waiting for wake word" else "Listening for your question"
         var text = "Heard: " + lastHeard
         if (lastAnswer.isNotEmpty()) text += "\n\n" + lastAnswer
         status(title, text)
     }
-    private var muted = false
-private fun muteBeep(on: Boolean) {
-    if (on == muted) return
-    val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-    if (on && am.isMusicActive) return   // don't mute your music
-    muted = on
-    val d = if (on) android.media.AudioManager.ADJUST_MUTE
-            else android.media.AudioManager.ADJUST_UNMUTE
-    for (st in intArrayOf(
-        android.media.AudioManager.STREAM_MUSIC,
-        android.media.AudioManager.STREAM_NOTIFICATION,
-        android.media.AudioManager.STREAM_SYSTEM)) {
-        try { am.adjustStreamVolume(st, d, 0) } catch (_: Exception) {}
+
+    // ---------- beep muting ----------
+    private var muted = false        // notification + system streams muted by us
+    private var musicMuted = false   // music stream muted by us
+
+    private fun beepPrefs() = getSharedPreferences("beep_state", Context.MODE_PRIVATE)
+
+    private fun setStream(am: AudioManager, st: Int, mute: Boolean) {
+        try {
+            am.adjustStreamVolume(
+                st, if (mute) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0)
+        } catch (_: Exception) {}
     }
-}
+
+    private fun muteBeep(on: Boolean) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (on) {
+            if (!muted) {
+                setStream(am, AudioManager.STREAM_NOTIFICATION, true)
+                setStream(am, AudioManager.STREAM_SYSTEM, true)
+                muted = true
+                beepPrefs().edit().putBoolean("muted", true).apply()
+            }
+            // never silence the user's music/video while it is playing
+            val playing = am.isMusicActive
+            if (playing && musicMuted) {
+                setStream(am, AudioManager.STREAM_MUSIC, false)
+                musicMuted = false
+            } else if (!playing && !musicMuted) {
+                setStream(am, AudioManager.STREAM_MUSIC, true)
+                musicMuted = true
+            }
+        } else {
+            if (muted) {
+                setStream(am, AudioManager.STREAM_NOTIFICATION, false)
+                setStream(am, AudioManager.STREAM_SYSTEM, false)
+            }
+            if (musicMuted) setStream(am, AudioManager.STREAM_MUSIC, false)
+            muted = false
+            musicMuted = false
+            beepPrefs().edit().putBoolean("muted", false).apply()
+        }
+    }
+
+    // if the app was killed while muted, restore the volume on next start
+    private fun restoreIfStuckMuted() {
+        if (beepPrefs().getBoolean("muted", false)) {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            setStream(am, AudioManager.STREAM_NOTIFICATION, false)
+            setStream(am, AudioManager.STREAM_SYSTEM, false)
+            setStream(am, AudioManager.STREAM_MUSIC, false)
+            beepPrefs().edit().putBoolean("muted", false).apply()
+        }
+    }
 
     // ---------- listening ----------
     private fun scheduleListen(m: Int, delay: Long) {
@@ -182,6 +245,7 @@ private fun muteBeep(on: Boolean) {
 
     private fun stopRecognizer() {
         listening = false
+        handler.removeCallbacks(wakeConfirm)
         val r = recognizer
         recognizer = null
         if (r != null) {
@@ -202,6 +266,9 @@ private fun muteBeep(on: Boolean) {
             return
         }
         try {
+            // silent while waiting for the wake word, normal sound for questions
+            if (SILENT_MODE) muteBeep(m == 0) else muteBeep(false)
+
             val r = SpeechRecognizer.createSpeechRecognizer(this)
             r.setRecognitionListener(listener)
             val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -215,10 +282,13 @@ private fun muteBeep(on: Boolean) {
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang)
             }
-            muteBeep(m == 0)
             if (m == 0) {
-    i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-    i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L)
+                i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                // short silence so the result arrives quickly (8000 made it wait 8 seconds)
+                i.putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+                i.putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
             }
             recognizer = r
             listening = true
@@ -251,21 +321,24 @@ private fun muteBeep(on: Boolean) {
             if (!listening) return
             val t = first(b) ?: return
             heard(t)
-            if (mode == 0 && isWake(t)) {
-                listening = false
-                handler.post { onWake() }
+            if (mode == 0) {
+                // any new partial cancels a pending wake; only an EXACT match arms it
+                handler.removeCallbacks(wakeConfirm)
+                if (isWake(t)) handler.postDelayed(wakeConfirm, WAKE_CONFIRM_MS)
             }
         }
 
         override fun onResults(b: Bundle?) {
             if (!listening) return
             listening = false
+            handler.removeCallbacks(wakeConfirm)
             val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val top = list?.firstOrNull()
             if (top != null) heard(top)
             if (mode == 0) {
-                if (list != null && list.any { isWake(it) }) onWake()
-                else scheduleListen(0, 150)
+                // only the top result, and it must be exactly the wake word
+                if (top != null && isWake(top)) onWake()
+                else scheduleListen(0, 100)
             } else {
                 val q = top?.trim().orEmpty()
                 if (q.isEmpty()) scheduleListen(0, 200) else askAI(q)
@@ -275,6 +348,7 @@ private fun muteBeep(on: Boolean) {
         override fun onError(e: Int) {
             if (!listening) return
             listening = false
+            handler.removeCallbacks(wakeConfirm)
             when (e) {
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     status("Microphone permission needed", "Open the app and allow the microphone.")
@@ -282,7 +356,7 @@ private fun muteBeep(on: Boolean) {
                 }
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> scheduleListen(0, 1500)
                 SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleListen(0, 150)
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleListen(0, 100)
                 else -> scheduleListen(0, 800)
             }
         }
@@ -292,24 +366,21 @@ private fun muteBeep(on: Boolean) {
         t.lowercase().replace(Regex("[^\\p{L}\\p{N} ]"), " ")
             .replace(Regex("\\s+"), " ").trim()
 
+    // EXACT match only: the whole sentence heard must equal one of the wake words
     private fun isWake(text: String): Boolean {
         val t = norm(text)
         if (t.isEmpty()) return false
-        val exact = Cfg.bool(p(), "exact")
         for (w in s("wake_words").split(",")) {
             val ww = norm(w)
             if (ww.isEmpty()) continue
-            if (exact) {
-                if (t == ww) return true
-            } else if ((" " + t + " ").contains(" " + ww + " ")) {
-                return true
-            }
+            if (t == ww) return true
         }
         return false
     }
 
     // ---------- flow ----------
     private fun onWake() {
+        handler.removeCallbacks(wakeConfirm)
         muteBeep(false)
         stopRecognizer()
         handler.removeCallbacks(restartRunnable)
@@ -369,7 +440,8 @@ private fun muteBeep(on: Boolean) {
         return apps.firstOrNull { norm(it.first).replace(" ", "") == n }
             ?: apps.firstOrNull { norm(it.first).replace(" ", "").contains(n) }
     }
-            private fun tryCommand(q: String): String? {
+
+    private fun tryCommand(q: String): String? {
         val t = norm(q)
         Regex("^(?:agent|task) (.+)$").find(t)?.let { m ->
             val svc = PhoneAgentService.instance
@@ -405,8 +477,7 @@ private fun muteBeep(on: Boolean) {
             if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching"
         }
         return null
-            }
-    
+    }
 
     // ---------- speech ----------
     private fun speak(text: String, id: String) {
@@ -517,113 +588,24 @@ private fun muteBeep(on: Boolean) {
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT)
-            val dim = Cfg.int(pr, "dim")
-            if (dim > 0) {
-                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND
-                lp.dimAmount = dim / 100f
-            }
-            val blur = Cfg.int(pr, "blur")
-            if (Build.VERSION.SDK_INT >= 31 && blur > 0) {
-                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                lp.blurBehindRadius = (blur * resources.displayMetrics.density).toInt()
-            }
+            lp.gravity = Gravity.TOP or Gravity.START
             getSystemService(WindowManager::class.java).addView(wv, lp)
             overlay = wv
-            handler.postDelayed(hideRunnable, dur * 1000L + 700L)
+            handler.postDelayed(hideRunnable, dur * 1000L)
         } catch (e: Exception) {
-            status("Overlay problem", e.message ?: "unknown")
+            overlay = null
         }
     }
 
-    private fun html(text: String, dur: Int): String {
-        val pr = p()
-        fun col(k: String): String {
-            val v = Cfg.str(pr, k).trim()
-            return if (Regex("^#[0-9a-fA-F]{6}\$").matches(v)) v else Cfg.default(k)
+    // loads assets/index.html and puts in the greeting text + duration
+    private fun html(text: String, durSec: Int): String {
+        val raw = try {
+            assets.open("index.html").bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            return "<html><body style='background:transparent'></body></html>"
         }
-        val cc = col("comet_color")
-        val tc = col("text_color")
-        val c = Color.parseColor(cc)
-        val font = Cfg.str(pr, "font")
-        val css: String
-        val link: String
-        when (font) {
-            "System cursive" -> { css = "cursive"; link = "" }
-            "System sans" -> { css = "sans-serif"; link = "" }
-            else -> {
-                css = "'" + font + "', cursive"
-                link = "<link href=\"https://fonts.googleapis.com/css2?family=" +
-                    font.replace(" ", "+") + "&display=swap\" rel=\"stylesheet\">"
-            }
-        }
-        val dir = listOf("Down-left", "Down-right", "Straight down")
-            .indexOf(Cfg.str(pr, "direction")).coerceAtLeast(0)
-
-        val page = """<!doctype html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-@@LINK@@
-<style>
-html,body{margin:0;height:100%;overflow:hidden;background:transparent;transition:opacity .6s}
-canvas{position:fixed;left:0;top:0;width:100%;height:100%}
-#t{position:fixed;left:0;right:0;top:@@TOP@@%;transform:translateY(-50%);text-align:center;font-family:@@FONT@@;font-size:@@SIZE@@px;color:@@TCOL@@;text-shadow:0 0 18px @@CCOL@@,0 0 4px #000;padding:0 20px;opacity:0;animation:fin .8s ease forwards}
-@keyframes fin{from{opacity:0;transform:translateY(-40%)}to{opacity:1;transform:translateY(-50%)}}
-</style></head><body><canvas id="c"></canvas><div id="t"></div>
-<script>
-document.getElementById('t').textContent=@@JSTEXT@@;
-var C=document.getElementById('c'),X=C.getContext('2d');
-function rs(){C.width=innerWidth;C.height=innerHeight}rs();addEventListener('resize',rs);
-var DIR=@@DIR@@,SP=@@SPEED@@,TL=@@TAIL@@,DN=@@DENS@@,SPK=@@SPARK@@,COL=[@@R@@,@@G@@,@@B@@];
-function rgba(a){return 'rgba('+COL[0]+','+COL[1]+','+COL[2]+','+a+')'}
-var cm=[],pt=[];
-function spawn(){
-  var w=C.width,h=C.height,px,py;
-  if(DIR==2){px=Math.random()*w;py=-20}
-  else if(DIR==0){if(Math.random()<0.6){px=Math.random()*w*1.2;py=-20}else{px=w+20;py=Math.random()*h*0.5}}
-  else{if(Math.random()<0.6){px=-w*0.2+Math.random()*w*1.2;py=-20}else{px=-20;py=Math.random()*h*0.5}}
-  var s=(5+SP*2.5)*(0.7+Math.random()*0.6);
-  var vx=DIR==0?-0.6:(DIR==1?0.6:0),vy=1,n=Math.sqrt(vx*vx+vy*vy);
-  cm.push({x:px,y:py,vx:vx/n*s,vy:vy/n*s,l:TL*28+40,w:2+Math.random()*2});
-}
-for(var k=0;k<DN;k++)spawn();
-function frame(){
-  X.clearRect(0,0,C.width,C.height);
-  if(Math.random()<DN*0.025)spawn();
-  for(var i=cm.length-1;i>=0;i--){
-    var m=cm[i];m.x+=m.vx;m.y+=m.vy;
-    var sp=Math.sqrt(m.vx*m.vx+m.vy*m.vy),tx=m.x-m.vx/sp*m.l,ty=m.y-m.vy/sp*m.l;
-    var g=X.createLinearGradient(m.x,m.y,tx,ty);g.addColorStop(0,rgba(1));g.addColorStop(1,rgba(0));
-    X.strokeStyle=g;X.lineWidth=m.w;X.lineCap='round';X.beginPath();X.moveTo(m.x,m.y);X.lineTo(tx,ty);X.stroke();
-    X.shadowColor=rgba(1);X.shadowBlur=14;X.fillStyle='#ffffff';X.beginPath();X.arc(m.x,m.y,m.w*0.9,0,6.283);X.fill();X.shadowBlur=0;
-    if(SPK&&Math.random()<0.6)pt.push({x:m.x,y:m.y,vx:(Math.random()-0.5)*1.5,vy:(Math.random()-0.5)*1.5,a:1});
-    if(m.y>C.height+400||m.x<-400||m.x>C.width+400)cm.splice(i,1);
-  }
-  for(var j=pt.length-1;j>=0;j--){
-    var q=pt[j];q.x+=q.vx;q.y+=q.vy;q.a-=0.02;
-    if(q.a<=0){pt.splice(j,1);continue}
-    X.fillStyle=rgba(q.a);X.beginPath();X.arc(q.x,q.y,1.6,0,6.283);X.fill();
-  }
-  requestAnimationFrame(frame);
-}
-frame();
-setTimeout(function(){document.body.style.opacity=0},(@@DUR@@-0.6)*1000);
-</script></body></html>"""
-
-        return page
-            .replace("@@LINK@@", link)
-            .replace("@@TOP@@", Cfg.int(pr, "text_top").toString())
-            .replace("@@FONT@@", css)
-            .replace("@@SIZE@@", Cfg.int(pr, "text_size").toString())
-            .replace("@@TCOL@@", tc)
-            .replace("@@CCOL@@", cc)
-            .replace("@@JSTEXT@@", JSONObject.quote(text))
-            .replace("@@DIR@@", dir.toString())
-            .replace("@@SPEED@@", Cfg.int(pr, "speed").toString())
-            .replace("@@TAIL@@", Cfg.int(pr, "tail").toString())
-            .replace("@@DENS@@", Cfg.int(pr, "density").toString())
-            .replace("@@SPARK@@", if (Cfg.bool(pr, "sparkles")) "1" else "0")
-            .replace("@@R@@", Color.red(c).toString())
-            .replace("@@G@@", Color.green(c).toString())
-            .replace("@@B@@", Color.blue(c).toString())
-            .replace("@@DUR@@", dur.toString())
+        return raw
+            .replace("q.get('text')||'Yes Aryan'", JSONObject.quote(text))
+            .replace("parseInt(q.get('ms')||'6000',10)", (durSec * 1000).toString())
     }
 }
