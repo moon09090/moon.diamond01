@@ -1,1 +1,3 @@
-
+<resources>
+    <string name="agent_description">Lets the AI assistant see the screen and perform taps and typing that you request.</string>
+</resources>
