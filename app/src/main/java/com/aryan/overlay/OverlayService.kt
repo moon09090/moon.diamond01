@@ -371,18 +371,17 @@ private fun muteBeep(on: Boolean) {
     }
 
     private fun tryCommand(q: String): String? {
-        val t = norm(q) private fun tryCommand(q: String): String? {
-    val t = norm(q)
-    Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m ->
-        val svc = PhoneAgentService.instance
-        if (svc != null) {
-            if (PhoneAgentService.model == null)
-                PhoneAgentService.model = OpenRouterModel(s("key").trim())
-            svc.runGoal(m.groupValues[1])
-            return "Okay, working on it"
+        val t = norm(q)     private fun tryCommand(q: String): String? {
+        val t = norm(q)
+        Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m ->
+            val svc = PhoneAgentService.instance
+            if (svc != null) {
+                if (PhoneAgentService.model == null)
+                    PhoneAgentService.model = OpenRouterModel(s("key").trim())
+                svc.runGoal(m.groupValues[1])
+                return "Okay, working on it"
+            }
         }
-    }
-    Regex("^(?:please )?(?:open|launch|start) (.+)$")...
         Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
             val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
             val hit = findApp(name)
@@ -408,7 +407,7 @@ private fun muteBeep(on: Boolean) {
             if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching"
         }
         return null
-    }
+        }
 
     // ---------- speech ----------
     private fun speak(text: String, id: String) {
