@@ -369,9 +369,7 @@ private fun muteBeep(on: Boolean) {
         return apps.firstOrNull { norm(it.first).replace(" ", "") == n }
             ?: apps.firstOrNull { norm(it.first).replace(" ", "").contains(n) }
     }
-
-    private fun tryCommand(q: String): String? {
-        val t = norm(q)     private fun tryCommand(q: String): String? {
+        private fun tryCommand(q: String): String? {
         val t = norm(q)
         Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m ->
             val svc = PhoneAgentService.instance
@@ -381,8 +379,8 @@ private fun muteBeep(on: Boolean) {
                 svc.runGoal(m.groupValues[1])
                 return "Okay, working on it"
             }
-        }
-        Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
+        } 
+            find(t)?.let { m ->
             val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
             val hit = findApp(name)
             if (hit != null) {
@@ -409,9 +407,10 @@ private fun muteBeep(on: Boolean) {
         return null
         }
 
+    
+
     // ---------- speech ----------
     private fun speak(text: String, id: String) {
-        muteBeep(false)
         val t = tts
         if (t == null || !ttsReady || text.isBlank()) {
             handler.post { onSpoken(id) }
@@ -628,4 +627,5 @@ setTimeout(function(){document.body.style.opacity=0},(@@DUR@@-0.6)*1000);
             .replace("@@B@@", Color.blue(c).toString())
             .replace("@@DUR@@", dur.toString())
     }
+}
 }
