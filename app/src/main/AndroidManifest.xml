@@ -18,7 +18,7 @@
     </queries>
 
     <application
-        android:label="Aryan Overlay"
+        android:label="Moon AI NEW"
         android:usesCleartextTraffic="false"
         android:theme="@android:style/Theme.DeviceDefault">
 

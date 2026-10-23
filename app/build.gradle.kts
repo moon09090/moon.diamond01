@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.aryan.overlay"
+        applicationId = "com.aryan.moonnew"
         minSdk = 26
         targetSdk = 33
         versionCode = 2
