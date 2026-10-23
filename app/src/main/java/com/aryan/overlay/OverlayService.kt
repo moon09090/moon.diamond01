@@ -13,7 +13,11 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraManager
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.net.Uri
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -34,6 +38,10 @@ import android.view.WindowManager
 import android.webkit.WebView
 import org.json.JSONArray
 import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import java.io.File
+import java.util.zip.ZipInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -46,24 +54,12 @@ class OverlayService : Service() {
         private const val CH = "overlay_status"
         private const val NID = 1
 
-        // true  = silence the recognizer beeps while waiting for the wake word
-        //         (also mutes notification/system sounds during that time)
-        // false = never touch the phone volume (beeps may be heard)
-        private const val SILENT_MODE = true
-
-        // after the wake word is heard "exactly", wait this long to make sure
-        // the user did not keep talking (so "yes aryan is great" does NOT trigger)
-        private const val WAKE_CONFIRM_MS = 700L
-
-        // Music fix: while music/video is playing, the mic restarts make the audio
-        // stutter or slow down (worst on Bluetooth headphones). With this true the
-        // app pauses wake-word listening while media plays and resumes within ~2 s
-        // after it stops. Set to false to keep listening during music.
-        private const val PAUSE_WHEN_MUSIC_PLAYS = true
-
-        // Even if the option above is false, still pause when music plays through
-        // Bluetooth, because the mic forces Bluetooth into a low-quality mode.
-        private const val PAUSE_ON_BLUETOOTH_MUSIC = true
+        // Offline wake-word model. It is downloaded ONCE (about 40 MB) the first time
+        // the app runs, then stored on the phone. Other options from
+        // https://alphacephei.com/vosk/models  e.g. "vosk-model-small-en-in-0.4"
+        // (Indian English). Change only the name; the URL is built from it.
+        private const val MODEL_NAME = "vosk-model-small-en-us-0.15"
+        private const val MODEL_URL = "https://alphacephei.com/vosk/models/" + MODEL_NAME + ".zip"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -85,21 +81,12 @@ class OverlayService : Service() {
     private val restartRunnable = Runnable { startListen(pendingMode) }
     private val hideRunnable = Runnable { hideOverlay() }
 
-    // fires only if the exact wake word stayed the final thing heard
-    private val wakeConfirm = Runnable {
-        if (listening && mode == 0) {
-            listening = false
-            onWake()
-        }
-    }
-
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
             when (i?.action) {
                 ACTION_SHOW -> showOverlay(s("reply"))
                 ACTION_WAKE -> onWake()
                 ACTION_VOICE -> {
-                    muteBeep(false)
                     stopRecognizer()
                     speak(s("reply"), "test")
                 }
@@ -161,7 +148,8 @@ class OverlayService : Service() {
         stopRecognizer()
         hideOverlay()
         try { tts?.shutdown() } catch (_: Exception) {}
-        muteBeep(false)
+        try { voskModel?.close() } catch (_: Throwable) {}
+        voskModel = null
         super.onDestroy()
     }
 
@@ -192,57 +180,197 @@ class OverlayService : Service() {
         status(title, text)
     }
 
-    // ---------- beep muting ----------
-    // The MUSIC stream is never touched, so your music is not affected.
-    private var muted = false
-
+    // ---------- one-time cleanup of volume left muted by older versions ----------
     private fun beepPrefs() = getSharedPreferences("beep_state", Context.MODE_PRIVATE)
 
-    private fun setStream(am: AudioManager, st: Int, mute: Boolean) {
-        try {
-            am.adjustStreamVolume(
-                st, if (mute) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0)
-        } catch (_: Exception) {}
-    }
-
-    private fun muteBeep(on: Boolean) {
-        if (on == muted) return
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        setStream(am, AudioManager.STREAM_NOTIFICATION, on)
-        setStream(am, AudioManager.STREAM_SYSTEM, on)
-        muted = on
-        beepPrefs().edit().putBoolean("muted", on).apply()
-    }
-
-    // if the app was killed while muted, restore the volume on next start
     private fun restoreIfStuckMuted() {
         if (beepPrefs().getBoolean("muted", false)) {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            setStream(am, AudioManager.STREAM_NOTIFICATION, false)
-            setStream(am, AudioManager.STREAM_SYSTEM, false)
-            setStream(am, AudioManager.STREAM_MUSIC, false)
+            try {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                for (st in intArrayOf(AudioManager.STREAM_NOTIFICATION,
+                    AudioManager.STREAM_SYSTEM, AudioManager.STREAM_MUSIC)) {
+                    try { am.adjustStreamVolume(st, AudioManager.ADJUST_UNMUTE, 0) }
+                    catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
             beepPrefs().edit().putBoolean("muted", false).apply()
         }
     }
 
-    private fun bluetoothAudioOut(am: AudioManager): Boolean {
-        return try {
-            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any {
-                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                (Build.VERSION.SDK_INT >= 31 &&
-                    (it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                     it.type == android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER))
+    // ---------- silent always-on wake word (offline, no beeps, no restarts) ----------
+    // One AudioRecord stays open and feeds an offline recognizer (Vosk). Nothing is
+    // restarted, nothing beeps, and no volume is ever changed, so music and video are
+    // not touched. The built-in phone mic is requested so Bluetooth headphones are not
+    // pushed into low-quality call mode.
+    @Volatile private var voskModel: Model? = null
+    @Volatile private var modelLoading = false
+    @Volatile private var wakeRun = false
+    private var wakeThread: Thread? = null
+
+    private fun modelDir() = File(filesDir, "vosk/" + MODEL_NAME)
+
+    private fun ensureModel() {
+        if (voskModel != null || modelLoading || destroyed) return
+        modelLoading = true
+        Thread {
+            try {
+                val dir = modelDir()
+                val ready = File(dir, ".ready")
+                if (!ready.exists()) {
+                    dir.deleteRecursively()
+                    handler.post { status("Wake word setup", "Downloading offline voice model (one time)...") }
+                    downloadAndUnzip(dir)
+                    ready.writeText("ok")
+                }
+                handler.post { status("Wake word setup", "Loading voice model...") }
+                voskModel = Model(dir.absolutePath)
+                handler.post {
+                    if (!destroyed) {
+                        refreshStatus()
+                        if (mode == 0) scheduleListen(0, 100)
+                    }
+                }
+            } catch (t: Throwable) {
+                try { modelDir().deleteRecursively() } catch (_: Throwable) {}
+                handler.post {
+                    status("Wake word model problem",
+                        "Check internet and storage. Retrying. " + (t.message ?: "").take(80))
+                }
+            } finally {
+                modelLoading = false
             }
-        } catch (_: Exception) { false }
+        }.start()
     }
 
-    // true = do not open the mic right now because media is playing
-    private fun shouldPauseForMusic(): Boolean {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        if (!am.isMusicActive) return false
-        if (PAUSE_WHEN_MUSIC_PLAYS) return true
-        return PAUSE_ON_BLUETOOTH_MUSIC && bluetoothAudioOut(am)
+    private fun downloadAndUnzip(dest: File) {
+        val tmp = File(cacheDir, "vosk_model.zip")
+        val c = URL(MODEL_URL).openConnection() as HttpURLConnection
+        c.connectTimeout = 20000
+        c.readTimeout = 30000
+        val total = c.contentLengthLong
+        c.inputStream.use { ins ->
+            tmp.outputStream().use { out ->
+                val buf = ByteArray(65536)
+                var done = 0L
+                var lastStep = -1
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                    done += n
+                    if (total > 0) {
+                        val step = (done * 100 / total).toInt() / 10
+                        if (step != lastStep) {
+                            lastStep = step
+                            handler.post {
+                                status("Wake word setup", "Downloading voice model " + (step * 10) + "%")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        dest.mkdirs()
+        val root = dest.canonicalPath
+        ZipInputStream(tmp.inputStream().buffered()).use { zin ->
+            var entry = zin.nextEntry
+            while (entry != null) {
+                // drop the zip's top-level folder name
+                val rel = entry.name.split("/").drop(1).joinToString("/")
+                if (rel.isNotEmpty()) {
+                    val out = File(dest, rel)
+                    if (!out.canonicalPath.startsWith(root)) throw Exception("bad zip entry")
+                    if (entry.isDirectory) {
+                        out.mkdirs()
+                    } else {
+                        out.parentFile?.mkdirs()
+                        out.outputStream().use { zin.copyTo(it) }
+                    }
+                }
+                zin.closeEntry()
+                entry = zin.nextEntry
+            }
+        }
+        tmp.delete()
+    }
+
+    private fun preferBuiltInMic(rec: AudioRecord) {
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            am.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+                ?.let { rec.setPreferredDevice(it) }
+        } catch (_: Exception) {}
+    }
+
+    private fun startWake() {
+        if (destroyed || wakeRun) return
+        if (wakeThread?.isAlive == true) { scheduleListen(0, 200); return }
+        val model = voskModel
+        if (model == null) {
+            ensureModel()
+            scheduleListen(0, 3000)
+            return
+        }
+        wakeRun = true
+        val t = Thread {
+            var rec: AudioRecord? = null
+            var vr: Recognizer? = null
+            var failed = false
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                val rate = 16000
+                val minBuf = AudioRecord.getMinBufferSize(
+                    rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                val r = AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
+                    maxOf(minBuf, 32000))
+                rec = r
+                if (r.state != AudioRecord.STATE_INITIALIZED) throw Exception("microphone busy")
+                preferBuiltInMic(r)
+                val v = Recognizer(model, rate.toFloat())
+                vr = v
+                r.startRecording()
+                handler.post { if (wakeRun) refreshStatus() }
+                val buf = ShortArray(2048)
+                while (wakeRun) {
+                    val n = r.read(buf, 0, buf.size)
+                    if (n < 0) throw Exception("microphone read error")
+                    if (n == 0) { Thread.sleep(10); continue }
+                    if (v.acceptWaveForm(buf, n)) {
+                        val text = JSONObject(v.result).optString("text").trim()
+                        if (text.isNotEmpty()) handler.post { onWakeText(text) }
+                    }
+                }
+            } catch (e: Throwable) {
+                failed = true
+            } finally {
+                try { rec?.stop() } catch (_: Throwable) {}
+                try { rec?.release() } catch (_: Throwable) {}
+                try { vr?.close() } catch (_: Throwable) {}
+            }
+            if (failed && wakeRun) {
+                wakeRun = false
+                handler.post {
+                    status("Microphone problem", "Retrying...")
+                    scheduleListen(0, 2000)
+                }
+            }
+        }
+        wakeThread = t
+        t.start()
+    }
+
+    private fun stopWake() {
+        wakeRun = false
+    }
+
+    // runs on the main thread for every finished phrase the wake engine hears
+    private fun onWakeText(text: String) {
+        if (!wakeRun || mode != 0) return
+        heard(text)
+        if (isWake(text)) onWake()      // EXACT match only
     }
 
     // ---------- listening ----------
@@ -254,7 +382,7 @@ class OverlayService : Service() {
 
     private fun stopRecognizer() {
         listening = false
-        handler.removeCallbacks(wakeConfirm)
+        stopWake()
         val r = recognizer
         recognizer = null
         if (r != null) {
@@ -266,6 +394,7 @@ class OverlayService : Service() {
     private fun startListen(m: Int) {
         if (destroyed) return
         handler.removeCallbacks(restartRunnable)
+        if (m == 0 && wakeRun && recognizer == null) return   // already waiting silently
         stopRecognizer()
         mode = m
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
@@ -274,16 +403,12 @@ class OverlayService : Service() {
             scheduleListen(m, 3000)
             return
         }
-        if (m == 0 && shouldPauseForMusic()) {
-            muteBeep(false)
-            status("Paused while music plays", "Wake word listening resumes when it stops.")
-            scheduleListen(0, 2000)
+        if (m == 0) {
+            startWake()
             return
         }
+        // question mode: normal Android recognizer (one short beep = "I'm listening")
         try {
-            // silent while waiting for the wake word, normal sound for questions
-            if (SILENT_MODE) muteBeep(m == 0) else muteBeep(false)
-
             val r = SpeechRecognizer.createSpeechRecognizer(this)
             r.setRecognitionListener(listener)
             val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -296,14 +421,6 @@ class OverlayService : Service() {
             if (lang.isNotEmpty()) {
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
                 i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang)
-            }
-            if (m == 0) {
-                i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                // short silence so the result arrives quickly (8000 made it wait 8 seconds)
-                i.putExtra(
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-                i.putExtra(
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000L)
             }
             recognizer = r
             listening = true
@@ -336,43 +453,27 @@ class OverlayService : Service() {
             if (!listening) return
             val t = first(b) ?: return
             heard(t)
-            if (mode == 0) {
-                // any new partial cancels a pending wake; only an EXACT match arms it
-                handler.removeCallbacks(wakeConfirm)
-                if (isWake(t)) handler.postDelayed(wakeConfirm, WAKE_CONFIRM_MS)
-            }
         }
 
         override fun onResults(b: Bundle?) {
             if (!listening) return
             listening = false
-            handler.removeCallbacks(wakeConfirm)
-            val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            val top = list?.firstOrNull()
+            val top = first(b)
             if (top != null) heard(top)
-            if (mode == 0) {
-                // only the top result, and it must be exactly the wake word
-                if (top != null && isWake(top)) onWake()
-                else scheduleListen(0, 100)
-            } else {
-                val q = top?.trim().orEmpty()
-                if (q.isEmpty()) scheduleListen(0, 200) else askAI(q)
-            }
+            val q = top?.trim().orEmpty()
+            if (q.isEmpty()) scheduleListen(0, 200) else askAI(q)
         }
 
         override fun onError(e: Int) {
             if (!listening) return
             listening = false
-            handler.removeCallbacks(wakeConfirm)
             when (e) {
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     status("Microphone permission needed", "Open the app and allow the microphone.")
                     scheduleListen(0, 3000)
                 }
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> scheduleListen(0, 1500)
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleListen(0, 100)
-                else -> scheduleListen(0, 800)
+                else -> scheduleListen(0, 300)   // no question heard: go back to waiting
             }
         }
     }
@@ -395,8 +496,6 @@ class OverlayService : Service() {
 
     // ---------- flow ----------
     private fun onWake() {
-        handler.removeCallbacks(wakeConfirm)
-        muteBeep(false)
         stopRecognizer()
         handler.removeCallbacks(restartRunnable)
         val reply = s("reply")
