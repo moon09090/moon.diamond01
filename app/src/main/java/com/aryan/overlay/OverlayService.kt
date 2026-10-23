@@ -43,7 +43,11 @@ import android.provider.ContactsContract
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
+import kotlin.math.sqrt
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -65,12 +69,19 @@ class OverlayService : Service() {
         private const val CH = "overlay_status"
         private const val NID = 1
 
-        // Offline wake-word model. It is downloaded ONCE (about 40 MB) the first time
-        // the app runs, then stored on the phone. Other options from
-        // https://alphacephei.com/vosk/models  e.g. "vosk-model-small-en-in-0.4"
-        // (Indian English). Change only the name; the URL is built from it.
-        private const val MODEL_NAME = "vosk-model-small-en-us-0.15"
-        private const val MODEL_URL = "https://alphacephei.com/vosk/models/" + MODEL_NAME + ".zip"
+        // ---- wake word accuracy ----
+        // Offline voice model, downloaded once (about 40 MB). Empty = choose automatically:
+        // Indian English model if your phone region is India, otherwise US English.
+        // Or force one from https://alphacephei.com/vosk/models
+        private const val MODEL_OVERRIDE = ""
+
+        // How forgiving the wake word match is. 1.0 = must be exact.
+        // Lower = hears you more often but may trigger on similar words.
+        // 0.78 is a good start; try 0.85 if it triggers by mistake, 0.70 if it misses you.
+        private const val WAKE_TOLERANCE = 0.78
+
+        // when the wake word is in the model's vocabulary, each word must be this sure
+        private const val GRAMMAR_MIN_CONF = 0.55
 
         // ---- feature switches (true = on) ----
         private const val FOLLOW_UP = true            // keep listening after an AI answer
@@ -95,6 +106,8 @@ class OverlayService : Service() {
     private var lastHeard = "-"
     private var lastAnswer = ""
     private var afterAnswerMode = 0
+    private val recentMiss = ArrayList<String>()
+    @Volatile private var vocab: HashSet<String>? = null
     private var pendingGoal: String? = null
     private val history = ArrayList<Pair<String, String>>()
     private var lastChat = 0L
@@ -171,6 +184,7 @@ class OverlayService : Service() {
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
         stopRecognizer()
         hideOverlay()
+        hideResult()
         try { tts?.shutdown() } catch (_: Exception) {}
         try { voskModel?.close() } catch (_: Throwable) {}
         voskModel = null
@@ -204,6 +218,9 @@ class OverlayService : Service() {
             else -> "Listening for your question"
         }
         var text = "Heard: " + lastHeard
+        if (mode == 0 && recentMiss.isNotEmpty())
+            text += "\nNot matched: " + recentMiss.joinToString(" | ") +
+                "\n(Add the spelling it hears for your wake word in the wake words setting)"
         if (lastAnswer.isNotEmpty()) text += "\n\n" + lastAnswer
         status(title, text)
     }
@@ -235,44 +252,73 @@ class OverlayService : Service() {
     @Volatile private var wakeRun = false
     private var wakeThread: Thread? = null
 
-    private fun modelDir() = File(filesDir, "vosk/" + MODEL_NAME)
+    private fun modelCandidates(): List<String> {
+        if (MODEL_OVERRIDE.isNotEmpty()) return listOf(MODEL_OVERRIDE)
+        val india = Locale.getDefault().country.equals("IN", ignoreCase = true)
+        return if (india) listOf("vosk-model-small-en-in-0.4", "vosk-model-small-en-us-0.15")
+        else listOf("vosk-model-small-en-us-0.15")
+    }
+
+    // reads the model's word list so we know which words it can recognize
+    private fun loadVocab(dir: File) {
+        vocab = try {
+            val f = File(dir, "graph/words.txt")
+            if (!f.exists()) null else {
+                val set = HashSet<String>()
+                f.bufferedReader().useLines { lines ->
+                    lines.forEach { set.add(it.substringBefore(' ').lowercase()) }
+                }
+                set
+            }
+        } catch (_: Throwable) { null }
+    }
 
     private fun ensureModel() {
         if (voskModel != null || modelLoading || destroyed) return
         modelLoading = true
         Thread {
-            try {
-                val dir = modelDir()
-                val ready = File(dir, ".ready")
-                if (!ready.exists()) {
-                    dir.deleteRecursively()
-                    handler.post { status("Wake word setup", "Downloading offline voice model (one time)...") }
-                    downloadAndUnzip(dir)
-                    ready.writeText("ok")
+            var lastErr: Throwable? = null
+            var ok = false
+            for (name in modelCandidates()) {
+                val dir = File(filesDir, "vosk/" + name)
+                try {
+                    val ready = File(dir, ".ready")
+                    if (!ready.exists()) {
+                        dir.deleteRecursively()
+                        handler.post { status("Wake word setup", "Downloading offline voice model (one time)...") }
+                        downloadAndUnzip(dir, "https://alphacephei.com/vosk/models/" + name + ".zip")
+                        ready.writeText("ok")
+                    }
+                    handler.post { status("Wake word setup", "Loading voice model...") }
+                    voskModel = Model(dir.absolutePath)
+                    loadVocab(dir)
+                    ok = true
+                    break
+                } catch (t: Throwable) {
+                    lastErr = t
+                    try { dir.deleteRecursively() } catch (_: Throwable) {}
                 }
-                handler.post { status("Wake word setup", "Loading voice model...") }
-                voskModel = Model(dir.absolutePath)
+            }
+            if (ok) {
                 handler.post {
                     if (!destroyed) {
                         refreshStatus()
                         if (mode == 0) scheduleListen(0, 100)
                     }
                 }
-            } catch (t: Throwable) {
-                try { modelDir().deleteRecursively() } catch (_: Throwable) {}
+            } else {
                 handler.post {
                     status("Wake word model problem",
-                        "Check internet and storage. Retrying. " + (t.message ?: "").take(80))
+                        "Check internet and storage. Retrying. " + (lastErr?.message ?: "").take(80))
                 }
-            } finally {
-                modelLoading = false
             }
+            modelLoading = false
         }.start()
     }
 
-    private fun downloadAndUnzip(dest: File) {
+    private fun downloadAndUnzip(dest: File, url: String) {
         val tmp = File(cacheDir, "vosk_model.zip")
-        val c = URL(MODEL_URL).openConnection() as HttpURLConnection
+        val c = URL(url).openConnection() as HttpURLConnection
         c.connectTimeout = 20000
         c.readTimeout = 30000
         val total = c.contentLengthLong
@@ -331,6 +377,50 @@ class OverlayService : Service() {
         } catch (_: Exception) {}
     }
 
+    private fun wakeList(): List<String> =
+        s("wake_words").split(",").map { norm(it) }.filter { it.isNotEmpty() }
+
+    // If every wake word exists in the model's vocabulary, the recognizer is limited to
+    // ONLY those phrases (plus stop words and "unknown"). That is far more accurate.
+    // If a wake word is not in the vocabulary (like a rare name), returns null and the
+    // recognizer runs freely with forgiving matching instead.
+    private fun grammarJson(): String? {
+        val v = vocab ?: return null
+        val wakes = wakeList()
+        if (wakes.isEmpty()) return null
+        for (w in wakes) for (word in w.split(" ")) if (word !in v) return null
+        val arr = JSONArray()
+        for (w in wakes) arr.put(w)
+        for (sw in stopWords) if (sw.split(" ").all { it in v }) arr.put(sw)
+        arr.put("[unk]")
+        return arr.toString()
+    }
+
+    private fun parseCandidates(json: String): List<Pair<String, Double>> {
+        val out = ArrayList<Pair<String, Double>>()
+        val o = JSONObject(json)
+        if (o.has("alternatives")) {
+            val arr = o.getJSONArray("alternatives")
+            for (i in 0 until arr.length()) {
+                val tx = arr.getJSONObject(i).optString("text").trim()
+                if (tx.isNotEmpty()) out.add(tx to 1.0)
+            }
+        } else {
+            val tx = o.optString("text").trim()
+            if (tx.isNotEmpty()) {
+                var conf = 1.0
+                val r = o.optJSONArray("result")
+                if (r != null && r.length() > 0) {
+                    var sum = 0.0
+                    for (i in 0 until r.length()) sum += r.getJSONObject(i).optDouble("conf", 1.0)
+                    conf = sum / r.length()
+                }
+                out.add(tx to conf)
+            }
+        }
+        return out
+    }
+
     private fun startWake() {
         if (destroyed || wakeRun) return
         if (wakeThread?.isAlive == true) { scheduleListen(mode, 200); return }
@@ -340,10 +430,13 @@ class OverlayService : Service() {
             scheduleListen(mode, 3000)
             return
         }
+        val grammar = grammarJson()
         wakeRun = true
         val t = Thread {
             var rec: AudioRecord? = null
             var vr: Recognizer? = null
+            var agc: AutomaticGainControl? = null
+            var ns: NoiseSuppressor? = null
             var failed = false
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
@@ -357,8 +450,24 @@ class OverlayService : Service() {
                 rec = r
                 if (r.state != AudioRecord.STATE_INITIALIZED) throw Exception("microphone busy")
                 preferBuiltInMic(r)
-                val v = Recognizer(model, rate.toFloat())
+                // let the phone clean and level the sound when it can
+                try {
+                    if (AutomaticGainControl.isAvailable()) {
+                        agc = AutomaticGainControl.create(r.audioSessionId)
+                        agc?.setEnabled(true)
+                    }
+                } catch (_: Throwable) {}
+                try {
+                    if (NoiseSuppressor.isAvailable()) {
+                        ns = NoiseSuppressor.create(r.audioSessionId)
+                        ns?.setEnabled(true)
+                    }
+                } catch (_: Throwable) {}
+
+                val v = if (grammar != null) Recognizer(model, rate.toFloat(), grammar)
+                        else Recognizer(model, rate.toFloat())
                 vr = v
+                if (grammar != null) v.setWords(true) else v.setMaxAlternatives(5)
                 r.startRecording()
                 handler.post { if (wakeRun) refreshStatus() }
                 val buf = ShortArray(2048)
@@ -366,14 +475,25 @@ class OverlayService : Service() {
                     val n = r.read(buf, 0, buf.size)
                     if (n < 0) throw Exception("microphone read error")
                     if (n == 0) { Thread.sleep(10); continue }
+                    // gentle software boost for quiet voices (not for silence)
+                    var sum = 0.0
+                    for (i in 0 until n) sum += buf[i].toDouble() * buf[i].toDouble()
+                    val rms = sqrt(sum / n)
+                    if (rms in 120.0..2500.0) {
+                        val g = (3000.0 / rms).coerceAtMost(3.0)
+                        for (i in 0 until n)
+                            buf[i] = (buf[i] * g).toInt().coerceIn(-32768, 32767).toShort()
+                    }
                     if (v.acceptWaveForm(buf, n)) {
-                        val text = JSONObject(v.result).optString("text").trim()
-                        if (text.isNotEmpty()) handler.post { onWakeText(text) }
+                        val cands = parseCandidates(v.result)
+                        if (cands.isNotEmpty()) handler.post { onWakeTexts(cands) }
                     }
                 }
             } catch (e: Throwable) {
                 failed = true
             } finally {
+                try { agc?.release() } catch (_: Throwable) {}
+                try { ns?.release() } catch (_: Throwable) {}
                 try { rec?.stop() } catch (_: Throwable) {}
                 try { rec?.release() } catch (_: Throwable) {}
                 try { vr?.close() } catch (_: Throwable) {}
@@ -405,6 +525,7 @@ class OverlayService : Service() {
         cancelAgent()
         pendingGoal = null
         handler.removeCallbacks(restartRunnable)
+        hideResult()
         status("Stopped", "")
         scheduleListen(0, 300)
     }
@@ -417,17 +538,28 @@ class OverlayService : Service() {
         }
     }
 
-    // runs on the main thread for every finished phrase the engine hears
-    private fun onWakeText(text: String) {
-        if (!wakeRun) return
+    private fun noteMiss(text: String) {
+        if (recentMiss.lastOrNull() == text) return
+        recentMiss.add(text)
+        while (recentMiss.size > 3) recentMiss.removeAt(0)
+    }
+
+    // runs on the main thread for every finished phrase (best guess first, then alternatives)
+    private fun onWakeTexts(c: List<Pair<String, Double>>) {
+        if (!wakeRun || c.isEmpty()) return
         if (mode == 2) {                      // while it speaks: only "stop" counts
-            if (isStopWord(text)) interrupt()
+            if (c.any { isStopWord(it.first) }) interrupt()
             return
         }
         if (mode != 0) return
-        heard(text)
-        if (isWake(text)) onWake()            // EXACT match only
-        else if (isStopWord(text)) interrupt()
+        val top = c.first().first
+        heard(top)
+        for ((text, conf) in c) {
+            if (conf >= GRAMMAR_MIN_CONF && isWake(text)) { onWake(); return }
+        }
+        if (c.any { isStopWord(it.first) }) { interrupt(); return }
+        noteMiss(top)
+        refreshStatus()
     }
 
     // ---------- listening ----------
@@ -539,14 +671,42 @@ class OverlayService : Service() {
         t.lowercase().replace(Regex("[^\\p{L}\\p{N} ]"), " ")
             .replace(Regex("\\s+"), " ").trim()
 
-    // EXACT match only: the whole sentence heard must equal one of the wake words
+    // sound-alike simplification so "arian", "aryan", "ariyan" compare as close
+    private fun phon(t: String): String {
+        var x = norm(t).replace(" ", "")
+        x = x.replace("ph", "f").replace("ck", "k").replace("c", "k")
+            .replace("q", "k").replace("y", "i").replace("w", "v")
+        return x.replace(Regex("(.)\\1+"), "$1")      // double letters -> single
+    }
+
+    private fun similarity(a: String, b: String): Double {
+        if (a == b) return 1.0
+        if (a.isEmpty() || b.isEmpty()) return 0.0
+        var prev = IntArray(b.length + 1) { it }
+        var cur = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            cur[0] = i
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                cur[j] = minOf(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            }
+            val tmp = prev; prev = cur; cur = tmp
+        }
+        return 1.0 - prev[b.length].toDouble() / maxOf(a.length, b.length)
+    }
+
+    // The whole sentence heard must sound like one of the wake words
+    // (exact for very short wake words, forgiving by WAKE_TOLERANCE otherwise).
     private fun isWake(text: String): Boolean {
-        val t = norm(text)
+        val t = phon(text)
         if (t.isEmpty()) return false
-        for (w in s("wake_words").split(",")) {
-            val ww = norm(w)
+        for (w in wakeList()) {
+            val ww = phon(w)
             if (ww.isEmpty()) continue
             if (t == ww) return true
+            if (ww.length <= 4) continue                 // short words: exact only
+            if (t[0] != ww[0]) continue                  // must start the same
+            if (similarity(t, ww) >= WAKE_TOLERANCE) return true
         }
         return false
     }
@@ -578,6 +738,7 @@ class OverlayService : Service() {
         "do it", "go ahead", "yes please", "correct", "proceed", "affirmative")
 
     private fun askAI(q: String) {
+        hideResult()   // a result card must never cover the screen during a new command
         // 1) waiting for a yes/no about a risky agent task
         val pg = pendingGoal
         if (pg != null) {
@@ -586,15 +747,24 @@ class OverlayService : Service() {
             onAnswer(q, ans)
             return
         }
-        // 2) questions about what is on the screen
-        if (isScreenQuestion(q)) { askAboutScreen(q); return }
-        // 3) instant phone commands, no AI needed
+        // 2) "... show me on my screen" -> answer/calculation/task shown on a result card
+        val showReq = showOnScreenRequest(q)
+        if (showReq != null) { handleShowOnScreen(q, showReq); return }
+        // 3) screen access ONLY for: open/search/play this|that|it, and "show me"
+        if (isScreenCommand(q)) { handleScreenCommand(q); return }
+        // 4) "search ..." must come back with the real result, not just "searching"
+        val sq = searchQuery(q)
+        if (sq != null) { answerWithWeb(q, sq); return }
+        // 5) plain arithmetic is solved exactly on the phone
+        val calc = calcAnswer(q)
+        if (calc != null) { onAnswer(q, calc); return }
+        // 4) instant phone commands, no AI needed
         val local = tryCommand(q)
         if (local != null) {
             onAnswer(q, local, pendingGoal != null)
             return
         }
-        // 4) normal AI answer
+        // 5) normal AI answer
         status("Thinking...", "You: " + q)
         Thread {
             val ans = try {
@@ -607,6 +777,8 @@ class OverlayService : Service() {
     }
 
     private fun onAnswer(q: String, a: String, followUp: Boolean = false) {
+        lastQ = q
+        lastA = a
         lastAnswer = "You: " + q + "\nAI: " + a
         status("Answered", lastAnswer)
         afterAnswerMode = if (followUp) 1 else 0
@@ -622,11 +794,12 @@ class OverlayService : Service() {
         "\\b(pay|send|transfer|buy|order|purchase|delete|remove|uninstall|post|publish|call|" +
         "message|text|whatsapp|email|book|subscribe|reset|format)\\b")
 
-    private fun startAgent(goal: String): String {
+    // checkGoal = false only for goals this app wrote itself (the current app is still checked)
+    private fun startAgent(goal: String, checkGoal: Boolean = true): String {
         val svc = PhoneAgentService.instance
             ?: return "Please turn on the accessibility service for agent tasks"
         val pkg = try { svc.rootInActiveWindow?.packageName?.toString() } catch (_: Exception) { null }
-        if (sensitiveGoalRegex.containsMatchIn(norm(goal)) || sensitivePkg(pkg))
+        if ((checkGoal && sensitiveGoalRegex.containsMatchIn(norm(goal))) || sensitivePkg(pkg))
             return "I won't operate banking or password apps"
         if (PhoneAgentService.model == null)
             PhoneAgentService.model = OpenRouterModel(s("key").trim())
@@ -634,12 +807,68 @@ class OverlayService : Service() {
         return "Okay, working on it"
     }
 
+    // runs a task on the phone now (asks yes/no first only for risky ones)
+    private fun agentTask(goal: String, say: String = goal): String {
+        if (PhoneAgentService.instance == null)
+            return "Please turn on the accessibility service for agent tasks"
+        if (sensitiveGoalRegex.containsMatchIn(norm(goal)))
+            return "I won't operate banking or password apps"
+        if (CONFIRM_RISKY_TASKS && riskyGoalRegex.containsMatchIn(norm(goal))) {
+            pendingGoal = goal
+            return "You want me to " + say + ". Say yes to confirm"
+        }
+        return startAgent(goal)
+    }
+
+    // opens YouTube results, then the agent taps the first video so it really plays
+    private fun playOnYouTube(what: String): String {
+        val u = "https://www.youtube.com/results?search_query=" + Uri.encode(what)
+        if (!launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "I couldn't open YouTube"
+        if (PhoneAgentService.instance == null)
+            return "I opened YouTube for " + what +
+                ". Turn on the accessibility service and I will press play for you"
+        handler.postDelayed({
+            if (!destroyed) startAgent(
+                "On the YouTube search results for " + what + ", tap the first real video " +
+                    "result (not an ad, not a Short) so it starts playing. Stop once the " +
+                    "video is playing.", false)
+        }, 3500)
+        return "Playing " + what
+    }
+
     // ---------- screen reading ----------
-    private fun isScreenQuestion(q: String): Boolean {
+    // The screen is touched ONLY by: "open this/that/it", "search this/that/it",
+    // "play this/that/it" and "show me ...". Nothing else reads or edits the screen.
+    private val screenCmdRegex = Regex(
+        "^(?:please |hey |can you |could you )?" +
+        "(?:(?:open|search|play) (?:this|that|it)(?: .*)?|show me(?: .*)?)$")
+
+    private fun isScreenCommand(q: String): Boolean = screenCmdRegex.matches(norm(q))
+
+    private fun handleScreenCommand(q: String) {
         val t = norm(q)
-        return listOf("on my screen", "on the screen", "this screen", "this page",
-            "read my screen", "what am i looking at", "explain this", "summarize this")
-            .any { t.contains(it) }
+        if (Regex("\\bshow me\\b").containsMatchIn(t)) { askAboutScreen(q); return }
+        val goal = "The user said: \"" + q.trim() + "\". Look at the current screen, find what " +
+            "\"this\" or \"it\" refers to, and complete that request fully."
+        onAnswer(q, agentTask(goal, q.trim()), pendingGoal != null)
+    }
+
+    private fun searchQuery(q: String): String? =
+        Regex("^(?:please )?(?:search|google|look up)(?: for| about)? (.+)$")
+            .find(norm(q))?.groupValues?.get(1)
+
+    // searches the web and speaks the actual result
+    private fun answerWithWeb(q: String, ask: String) {
+        status("Searching...", "You: " + q)
+        Thread {
+            val ans = try {
+                callAI("Search the web now and give me the actual answer, not just that you " +
+                    "searched. Request: " + ask, q, true)
+            } catch (e: Exception) {
+                "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
+            }
+            handler.post { onAnswer(q, ans, FOLLOW_UP) }
+        }.start()
     }
 
     // null = service off, SCREEN_PRIVATE = sensitive app, otherwise the visible text
@@ -662,21 +891,272 @@ class OverlayService : Service() {
     private fun askAboutScreen(q: String) {
         val txt = screenText()
         when {
-            txt == null -> onAnswer(q, "Turn on the accessibility service so I can see the screen")
             txt == SCREEN_PRIVATE -> onAnswer(q, "That looks like a private app, so I won't read it")
-            txt.isBlank() -> onAnswer(q, "I can't find any text on this screen")
+            txt.isNullOrBlank() -> answerWithWeb(q, q)   // no screen text: still do the request
             else -> {
                 status("Reading screen...", "You: " + q)
                 Thread {
                     val ans = try {
                         callAI("Here is the text currently visible on my phone screen:\n" + txt +
-                            "\n\nMy request: " + q, q)
+                            "\n\nMy request: " + q +
+                            "\nDo exactly what I asked and give me the result.", q, true)
                     } catch (e: Exception) {
                         "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
                     }
                     handler.post { onAnswer(q, ans, FOLLOW_UP) }
                 }.start()
             }
+        }
+    }
+
+    // ---------- "show me on my screen": result card ----------
+    private var resultView: WebView? = null
+    private var lastQ = ""
+    private var lastA = ""
+    private val hideResultRunnable = Runnable { hideResult() }
+
+    private val onScreenRegex1 = Regex(
+        "\\b(?:show|display)(?: me| it| that| this| the result| the answer| up)*[ ,]*" +
+        "on (?:my |the )?(?:phone )?screen\\b")
+    private val onScreenRegex2 = Regex(
+        "^(?:please )?(?:show|display)(?: me)? (.+?)[ ,]*on (?:my |the )?(?:phone )?screen$")
+
+    // null = not a "show on screen" command; "" = show the last answer again; else the request
+    private fun showOnScreenRequest(q: String): String? {
+        val t = q.lowercase().trim().trimEnd('.', '?', '!')
+        var r: String
+        val m1 = onScreenRegex1.find(t)
+        if (m1 != null) {
+            r = t.substring(0, m1.range.first) + " " + t.substring(m1.range.last + 1)
+        } else {
+            val m2 = onScreenRegex2.find(t) ?: return null
+            r = m2.groupValues[1]
+            if (r in setOf("me", "it", "that", "this", "the result", "the answer")) r = ""
+        }
+        r = r.replace(Regex("\\s+"), " ").trim()
+        r = r.removePrefix("please ").removePrefix("and ").removeSuffix(" please")
+            .removeSuffix(" and").removeSuffix(" then").trim().trimEnd(',', '.')
+        return r
+    }
+
+    private fun handleShowOnScreen(q: String, r: String) {
+        if (r.isEmpty()) {
+            if (lastA.isEmpty()) {
+                onAnswer(q, "Ask me something first, then say show me on my screen")
+            } else {
+                showResult(lastQ, lastA)
+                scheduleListen(0, 300)
+            }
+            return
+        }
+        val calc = calcAnswer(r)
+        if (calc != null) { finishShow(q, r, calc, false); return }
+        val local = tryCommand(r)
+        if (local != null) { finishShow(q, r, local, pendingGoal != null); return }
+        status("Working on it...", "You: " + r)
+        Thread {
+            val ans = try {
+                callAI(r, r, needsWeb(r))
+            } catch (e: Exception) {
+                "Sorry, the AI failed: " + (e.message ?: "unknown").take(60)
+            }
+            handler.post { finishShow(q, r, ans, FOLLOW_UP) }
+        }.start()
+    }
+
+    private fun finishShow(q: String, r: String, a: String, follow: Boolean) {
+        onAnswer(q, a, follow)
+        showResult(r, a)
+    }
+
+    private fun hideResult() {
+        handler.removeCallbacks(hideResultRunnable)
+        val v = resultView
+        resultView = null
+        if (v != null) {
+            try { getSystemService(WindowManager::class.java).removeView(v) } catch (_: Exception) {}
+            try { v.destroy() } catch (_: Exception) {}
+        }
+    }
+
+    // tap the card to close it; it also closes by itself and when you say "stop"
+    private fun showResult(q: String, a: String) {
+        hideResult()
+        lastQ = q
+        lastA = a
+        if (!Settings.canDrawOverlays(this)) return
+        try {
+            val ms = (6000L + a.length * 70L).coerceIn(7000L, 25000L)
+            val wv = WebView(this)
+            wv.setBackgroundColor(Color.TRANSPARENT)
+            wv.settings.javaScriptEnabled = true
+            var downY = 0f
+            wv.setOnTouchListener { _, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> downY = e.rawY
+                    MotionEvent.ACTION_UP -> if (Math.abs(e.rawY - downY) < 24f) hideResult()
+                }
+                false
+            }
+            wv.loadDataWithBaseURL("https://localhost/", resultHtml(q, a, ms),
+                "text/html", "utf-8", null)
+            val lp = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT)
+            lp.gravity = Gravity.TOP or Gravity.START
+            getSystemService(WindowManager::class.java).addView(wv, lp)
+            resultView = wv
+            handler.postDelayed(hideResultRunnable, ms)
+        } catch (e: Exception) {
+            resultView = null
+        }
+    }
+
+    private fun resultHtml(q: String, a: String, ms: Long): String =
+        RESULT_HTML.replace("__Q__", JSONObject.quote(q))
+            .replace("__A__", JSONObject.quote(a))
+            .replace("__MS__", ms.toString())
+
+    private val RESULT_HTML = """
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:-apple-system,Roboto,'Segoe UI',sans-serif}
+body{display:flex;align-items:center;justify-content:center;padding:22px;
+ background:radial-gradient(ellipse at 50% 40%,rgba(30,36,90,.55),rgba(0,0,0,.78));
+ animation:fade .3s ease}
+.card{position:relative;width:100%;max-width:480px;max-height:78%;overflow:auto;
+ padding:26px 24px 20px;border-radius:30px;color:#fff;
+ background:linear-gradient(150deg,rgba(52,58,128,.97),rgba(18,22,58,.97) 70%);
+ border:1px solid rgba(255,255,255,.2);
+ box-shadow:0 24px 70px rgba(0,0,0,.55),0 0 70px rgba(110,130,255,.3),inset 0 1px 0 rgba(255,255,255,.18);
+ animation:pop .45s cubic-bezier(.2,1.25,.3,1)}
+.card:before{content:"";position:absolute;top:-60px;right:-50px;width:190px;height:190px;border-radius:50%;
+ background:radial-gradient(circle,rgba(94,224,255,.35),transparent 70%);pointer-events:none}
+.tag{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:600;letter-spacing:.16em;
+ text-transform:uppercase;padding:6px 12px;border-radius:99px;margin-bottom:16px;
+ background:rgba(140,160,255,.18);color:#b4bfff;border:1px solid rgba(160,175,255,.25)}
+.dot{width:7px;height:7px;border-radius:50%;background:#5ee0ff;box-shadow:0 0 10px #5ee0ff;animation:pulse 1.4s infinite}
+.q{font-size:15px;color:#c3caee;margin-bottom:14px;line-height:1.45;font-weight:500}
+.a{font-weight:800;line-height:1.22;white-space:pre-wrap;word-wrap:break-word;letter-spacing:-.01em;
+ background:linear-gradient(90deg,#fff 10%,#b3c1ff 55%,#7fe6ff);
+ -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.bar{height:4px;border-radius:4px;margin-top:22px;background:rgba(255,255,255,.12);overflow:hidden}
+.bar i{display:block;height:100%;width:100%;transform-origin:left;
+ background:linear-gradient(90deg,#7f8cff,#5ee0ff);animation:shrink 8s linear forwards}
+.hint{margin-top:11px;font-size:11px;color:#8089bd;text-align:center;letter-spacing:.04em}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes pop{from{opacity:0;transform:translateY(24px) scale(.92)}to{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes shrink{from{transform:scaleX(1)}to{transform:scaleX(0)}}
+</style></head><body>
+<div class="card">
+ <div class="tag"><span class="dot"></span>Answer</div>
+ <div class="q" id="q"></div>
+ <div class="a" id="a"></div>
+ <div class="bar"><i id="b"></i></div>
+ <div class="hint">Tap anywhere to close</div>
+</div>
+<script>
+var Q=__Q__,A=__A__,D=__MS__;
+document.getElementById('q').textContent=Q.charAt(0).toUpperCase()+Q.slice(1);
+var a=document.getElementById('a');a.textContent=A;
+var n=A.length;
+a.style.fontSize=(n<=10?72:n<=24?48:n<=70?30:n<=160?22:18)+'px';
+document.getElementById('b').style.animationDuration=D+'ms';
+</script></body></html>
+""".trimIndent()
+
+    // ---------- exact arithmetic on the phone ----------
+    private val calcPrefix = Regex(
+        "^(?:(?:what is|what s|what's|whats|calculate|compute|solve|work out|how much is|" +
+        "tell me|the result of|result of|answer of|value of|the)\\s+)+")
+
+    private fun fmtNum(d: Double): String {
+        if (d == Math.rint(d) && Math.abs(d) < 1e15) return d.toLong().toString()
+        return java.math.BigDecimal(d).setScale(8, java.math.RoundingMode.HALF_UP)
+            .stripTrailingZeros().toPlainString()
+    }
+
+    // returns the result text, or null when the sentence is not plain arithmetic
+    private fun calcAnswer(text: String): String? {
+        var e = text.lowercase().trim()
+        e = e.replace(calcPrefix, "")
+        e = e.replace(",", "").replace("×", "*").replace("÷", "/").replace("−", "-")
+        e = e.replace(Regex("(\\d+(?:\\.\\d+)?)\\s*(?:%|percent) of"), "$1/100*")
+        e = e.replace(Regex("square root of\\s*(\\d+(?:\\.\\d+)?)"), "sqrt($1)")
+        e = e.replace(Regex("\\b(?:multiplied by|times|into)\\b"), "*")
+            .replace(Regex("\\b(?:divided by|over)\\b"), "/")
+            .replace(Regex("\\bplus\\b"), "+")
+            .replace(Regex("\\bminus\\b"), "-")
+            .replace(Regex("\\bto the power of\\b|\\bpower\\b"), "^")
+            .replace(Regex("(?<=\\d)\\s*x\\s*(?=\\d)"), "*")
+        e = e.trim().trimEnd('?', '.', '=', ' ').replace(" ", "")
+        val chk = e.replace("sqrt", "")
+        if (chk.isEmpty() || !Regex("^[0-9+\\-*/().^]+$").matches(chk)) return null
+        if (!chk.any { it.isDigit() }) return null
+        if (!Regex("[+\\-*/^]").containsMatchIn(e) && !e.contains("sqrt")) return null
+        return try {
+            val v = CalcParser(e).parse()
+            if (v.isNaN() || v.isInfinite()) "That is undefined" else fmtNum(v)
+        } catch (_: Exception) { null }
+    }
+
+    private class CalcParser(val s: String) {
+        var i = 0
+        fun parse(): Double {
+            val v = expr()
+            if (i != s.length) throw Exception("bad")
+            return v
+        }
+        private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+        private fun expr(): Double {
+            var v = term()
+            while (peek() == '+' || peek() == '-') {
+                val op = s[i++]
+                val r = term()
+                v = if (op == '+') v + r else v - r
+            }
+            return v
+        }
+        private fun term(): Double {
+            var v = power()
+            while (peek() == '*' || peek() == '/') {
+                val op = s[i++]
+                val r = power()
+                v = if (op == '*') v * r else v / r
+            }
+            return v
+        }
+        private fun power(): Double {
+            val b = unary()
+            if (peek() == '^') { i++; return Math.pow(b, power()) }
+            return b
+        }
+        private fun unary(): Double {
+            if (peek() == '-') { i++; return -unary() }
+            if (peek() == '+') { i++; return unary() }
+            return atom()
+        }
+        private fun atom(): Double {
+            if (s.startsWith("sqrt", i)) { i += 4; return Math.sqrt(atom()) }
+            if (peek() == '(') {
+                i++
+                val v = expr()
+                if (peek() != ')') throw Exception("bad")
+                i++
+                return v
+            }
+            val st = i
+            while (peek().isDigit() || peek() == '.') i++
+            if (st == i) throw Exception("bad")
+            return s.substring(st, i).toDouble()
         }
     }
 
@@ -759,15 +1239,7 @@ class OverlayService : Service() {
         // ----- agent task (with safety confirmation) -----
         Regex("^(?:agent|task) (.+)$").find(t)?.let { m ->
             val goal = m.groupValues[1]
-            if (PhoneAgentService.instance == null)
-                return "Please turn on the accessibility service for agent tasks"
-            if (sensitiveGoalRegex.containsMatchIn(goal))
-                return "I won't operate banking or password apps"
-            if (CONFIRM_RISKY_TASKS && riskyGoalRegex.containsMatchIn(goal)) {
-                pendingGoal = goal
-                return "You want me to " + goal + ". Say yes to confirm"
-            }
-            return startAgent(goal)
+            return agentTask(goal)
         }
 
         // ----- memory -----
@@ -889,12 +1361,39 @@ class OverlayService : Service() {
         Regex("^(?:call|dial|phone) (.+)$").find(t)?.let { m -> return callTarget(m.groupValues[1]) }
 
         // ----- open apps, torch, search -----
-        Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
-            val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
+        // "open youtube" opens it; "open youtube and search cats" opens it AND does the rest
+        Regex("^(?:please )?(open|launch|start) (.+)$").find(t)?.let { m ->
+            val verb = m.groupValues[1]
+            val parts = m.groupValues[2].split(Regex(" (?:and then|and|then) "), 2)
+            val name = parts[0].removePrefix("the ").removeSuffix(" app").trim()
+            val rest = parts.getOrElse(1) { "" }.trim()
             val hit = findApp(name)
             if (hit != null) {
                 val i = packageManager.getLaunchIntentForPackage(hit.second)
-                if (i != null && launch(i)) return "Opening " + hit.first
+                if (i != null) {
+                    if (rest.isNotEmpty()) {
+                        val goal = "Open " + hit.first + " and " + rest
+                        if (PhoneAgentService.instance == null) {
+                            launch(i)
+                            return "Opening " + hit.first +
+                                ". Turn on the accessibility service so I can also " + rest
+                        }
+                        if (sensitiveGoalRegex.containsMatchIn(rest))
+                            return "I won't operate banking or password apps"
+                        if (CONFIRM_RISKY_TASKS && riskyGoalRegex.containsMatchIn(rest)) {
+                            pendingGoal = goal
+                            return "You want me to " + goal + ". Say yes to confirm"
+                        }
+                        if (!launch(i)) return "I couldn't open " + hit.first
+                        handler.postDelayed({
+                            if (!destroyed) startAgent("In " + hit.first + ": " + rest)
+                        }, 2500)
+                        return "Opening " + hit.first + " and doing it"
+                    }
+                    if (launch(i)) return "Opening " + hit.first
+                }
+            } else if (verb == "open") {
+                return "I couldn't find an app called " + name
             }
         }
         if (t.contains("torch") || t.contains("flashlight")) {
@@ -905,14 +1404,7 @@ class OverlayService : Service() {
                 return if (on) "Torch on" else "Torch off"
             } catch (_: Exception) {}
         }
-        Regex("^play (.+)$").find(t)?.let { m ->
-            val u = "https://www.youtube.com/results?search_query=" + Uri.encode(m.groupValues[1])
-            if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching YouTube"
-        }
-        Regex("^(?:search|google) (?:for )?(.+)$").find(t)?.let { m ->
-            val u = "https://www.google.com/search?q=" + Uri.encode(m.groupValues[1])
-            if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching"
-        }
+        Regex("^play (.+)$").find(t)?.let { m -> return playOnYouTube(m.groupValues[1]) }
         return null
     }
 
@@ -985,7 +1477,7 @@ class OverlayService : Service() {
     }
 
     // q = what is sent to the AI, shown = short version stored in memory
-    private fun callAI(q: String, shown: String): String {
+    private fun callAI(q: String, shown: String, forceWeb: Boolean = false): String {
         val key = s("key").trim()
         if (key.isEmpty()) return "Please add your API key in the app settings."
         val sys = s("system_prompt").replace("{name}", s("ai_name")) +
@@ -1006,7 +1498,7 @@ class OverlayService : Service() {
                     .put("messages", historyMessages(q))
                 if (web) b.put("tools", JSONArray().put(
                     JSONObject().put("type", "web_search_20250305")
-                        .put("name", "web_search").put("max_uses", 2)))
+                        .put("name", "web_search").put("max_uses", 3)))
                 return b.toString()
             }
             val txt = try {
@@ -1024,7 +1516,7 @@ class OverlayService : Service() {
             answer = sb.toString().trim().ifEmpty { "I couldn't find an answer." }
         } else {
             var m = if (model.isEmpty()) "anthropic/claude-haiku-5.5" else model
-            if (WEB_SEARCH && needsWeb(shown) && !m.endsWith(":online")) m += ":online"
+            if (WEB_SEARCH && (forceWeb || needsWeb(shown)) && !m.endsWith(":online")) m += ":online"
             val msgs = JSONArray().put(JSONObject().put("role", "system").put("content", sys))
             val hist = historyMessages(q)
             for (i in 0 until hist.length()) msgs.put(hist.getJSONObject(i))
