@@ -369,9 +369,9 @@ private fun muteBeep(on: Boolean) {
         return apps.firstOrNull { norm(it.first).replace(" ", "") == n }
             ?: apps.firstOrNull { norm(it.first).replace(" ", "").contains(n) }
     }
-        private fun tryCommand(q: String): String? {
+            private fun tryCommand(q: String): String? {
         val t = norm(q)
-        Regex("^(?:agent|do|task) (.+)$").find(t)?.let { m -> Regex("^(?:open|launch|start) (.+)$").find(t)?.let { m ->
+        Regex("^(?:agent|task) (.+)$").find(t)?.let { m ->
             val svc = PhoneAgentService.instance
             if (svc != null) {
                 if (PhoneAgentService.model == null)
@@ -379,8 +379,8 @@ private fun muteBeep(on: Boolean) {
                 svc.runGoal(m.groupValues[1])
                 return "Okay, working on it"
             }
-        } 
-            find(t)?.let { m ->
+        }
+        Regex("^(?:please )?(?:open|launch|start) (.+)$").find(t)?.let { m ->
             val name = m.groupValues[1].removePrefix("the ").removeSuffix(" app").trim()
             val hit = findApp(name)
             if (hit != null) {
@@ -405,8 +405,7 @@ private fun muteBeep(on: Boolean) {
             if (launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))) return "Searching"
         }
         return null
-        }
-
+            }
     
 
     // ---------- speech ----------
